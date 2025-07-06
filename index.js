@@ -108,7 +108,7 @@ app.post("/api/users", verifyToken, async (req, res) => {
         .json({ error: "Forbidden: Cannot modify another user's data" });
     }
     const user = await client
-      .db("music")
+      .db("test")
       .collection("users")
       .findOneAndUpdate(
         { uid },
