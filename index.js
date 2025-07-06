@@ -1,27 +1,28 @@
+require("dotenv").config();
 const express = require("express");
-const mongoose = require("mongoose");
-const dotenv = require("dotenv");
 const cors = require("cors");
-const helmet = require("helmet");
-const multer = require("multer");
-const ImageKit = require("imagekit");
 const cookieParser = require("cookie-parser");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
 const jwt = require("jsonwebtoken");
-const { getAuth } = require("firebase-admin/auth");
-const path = require("path");
-const serviceAccount = require(path.join(__dirname, "serviceAccountKey.json"));
-const admin = require("firebase-admin");
+const morgan = require("morgan");
+const http = require("http");
+const { Server } = require("socket.io");
+const mongoose = require("mongoose");
+const app = express();
+const PORT = process.env.PORT || 5000;
+const multer = require("multer");
+const upload = multer({ storage: multer.memoryStorage() }); 
 
+// ✅ Add firebase-admin import and initialization
+const admin = require("firebase-admin");
+const serviceAccount = require("./serviceAccountKey.json");
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
 }
 
-dotenv.config();
-
-const app = express();
-
+// ✅ Define allowedOrigins before using in CORS middleware
 const allowedOrigins = [
   "http://localhost:3000",
   "http://localhost:5173",
@@ -29,7 +30,7 @@ const allowedOrigins = [
   "https://audiovibe-21bd8.firebaseapp.com",
 ];
 
-// 🛡️ Middleware
+// Middleware
 app.use(
   cors({
     origin: function (origin, callback) {
@@ -43,13 +44,25 @@ app.use(
     credentials: true,
   })
 );
-app.use(helmet());
 app.use(express.json());
 app.use(cookieParser());
+app.use(morgan("dev"));
 
-// JWT secret and verifyToken middleware moved up here
+// MongoDB Client
+const client = new MongoClient(process.env.MONGO_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true,
+  serverApi: ServerApiVersion.v1,
+});
+client
+  .connect()
+  .then(() => console.log("✅ MongoDB connected"))
+  .catch((err) => console.error("❌ MongoDB connection error:", err));
+
+// JWT secret
 const jwtSecret = process.env.JWT_SECRET || "your_jwt_secret_here";
 
+// ✅ Define verifyToken middleware before all routes
 const verifyToken = async (req, res, next) => {
   const token = req.cookies?.token;
   console.log("Token received:", token);
@@ -67,16 +80,65 @@ const verifyToken = async (req, res, next) => {
   });
 };
 
-const upload = multer({ storage: multer.memoryStorage() });
-
-const imagekit = new ImageKit({
-  publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
-  privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
-  urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT,
+// Socket.IO setup
+const server = http.createServer(app);
+const io = new Server(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"],
+    allowedHeaders: ["my-custom-header"],
+    credentials: true,
+  },
 });
 
+// Routes
 app.get("/", (req, res) => {
   res.send("🎵 Audio Stream Server is Running!");
+});
+
+// User routes
+app.post("/api/users", verifyToken, async (req, res) => {
+  try {
+    const { uid, email, name, image, type, createdAt, provider } = req.body;
+    // Only allow user to create/update their own data
+    if (!uid || !email)
+      return res.status(400).json({ error: "uid and email required" });
+    if (req.user?.uid !== uid) {
+      return res.status(403).json({ error: "Forbidden: Cannot modify another user's data" });
+    }
+    const user = await client
+      .db("music")
+      .collection("users")
+      .findOneAndUpdate(
+        { uid },
+        { $set: { uid, email, name, image, type, createdAt, provider } },
+        { upsert: true, returnDocument: "after" }
+      );
+    res.status(201).json({ message: "User saved", user: user.value });
+  } catch (err) {
+    res
+      .status(400)
+      .json({ error: "Failed to save user", details: err.message });
+  }
+});
+
+app.get("/api/users/:uid", verifyToken, async (req, res) => {
+  try {
+    // Only allow user to access their own data
+    if (req.user?.uid !== req.params.uid) {
+      return res.status(403).json({ error: "Forbidden: Cannot access another user's data" });
+    }
+    const user = await client
+      .db("music")
+      .collection("users")
+      .findOne({ uid: req.params.uid });
+    if (!user) return res.status(404).json({ error: "User not found" });
+    res.json({ user });
+  } catch (err) {
+    res
+      .status(400)
+      .json({ error: "Failed to fetch user", details: err.message });
+  }
 });
 
 // Song model (minimal, for demo)
@@ -209,80 +271,6 @@ app.post("/api/upload-audio", upload.single("file"), async (req, res) => {
     res
       .status(500)
       .json({ error: "Audio upload failed", details: err && err.message });
-  }
-});
-
-// User model
-const userSchema = new mongoose.Schema({
-  uid: { type: String, required: true, unique: true },
-  name: String,
-  email: { type: String, required: true },
-  image: String,
-  type: String,
-  createdAt: String,
-  provider: String,
-});
-const User = mongoose.models.User || mongoose.model("User", userSchema);
-
-// Save user to DB
-app.post("/api/users", async (req, res) => {
-  try {
-    const { uid, email, name, image, type, createdAt, provider } = req.body;
-    if (!uid || !email)
-      return res.status(400).json({ error: "uid and email required" });
-
-    // Upsert user (update if exists, insert if not)
-    const user = await User.findOneAndUpdate(
-      { uid },
-      { uid, email, name, image, type, createdAt, provider },
-      { upsert: true, new: true, setDefaultsOnInsert: true }
-    );
-    res.status(201).json({ message: "User saved", user });
-  } catch (err) {
-    res
-      .status(400)
-      .json({ error: "Failed to save user", details: err.message });
-  }
-});
-
-// Get user by uid (protected)
-app.get("/api/users/:uid", verifyToken, async (req, res) => {
-  try {
-    const user = await User.findOne({ uid: req.params.uid });
-    if (!user) return res.status(404).json({ error: "User not found" });
-    res.json({ user });
-  } catch (err) {
-    res
-      .status(400)
-      .json({ error: "Failed to fetch user", details: err.message });
-  }
-});
-
-// Get all users
-app.get("/api/users", async (req, res) => {
-  try {
-    const users = await User.find();
-    res.json({ users });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch users" });
-  }
-});
-
-// Update user role (admin/staff/user)
-app.put("/api/users/:uid/role", async (req, res) => {
-  try {
-    const { type } = req.body;
-    const { uid } = req.params;
-    if (!["user", "staff", "admin"].includes(type)) {
-      return res.status(400).json({ error: "Invalid role" });
-    }
-    const user = await User.findOneAndUpdate({ uid }, { type }, { new: true });
-    if (!user) return res.status(404).json({ error: "User not found" });
-    res.json({ message: "Role updated", user });
-  } catch (err) {
-    res
-      .status(400)
-      .json({ error: "Failed to update role", details: err.message });
   }
 });
 
@@ -482,21 +470,13 @@ app.get("/api/playlists/top", async (req, res) => {
   }
 });
 
-// 🔌 Connect DB and start server
-mongoose
-  .connect(process.env.MONGO_URI)
-  .then(() => {
-    app.listen(PORT, () => console.log(`🔥 Server is running on port ${PORT}`));
-  })
-  .catch((err) => console.error("❌ DB Connection Error:", err));
-
 // Firebase Auth to Backend JWT bridge
 app.post("/api/auth/login", async (req, res) => {
   try {
     const { idToken } = req.body;
     if (!idToken) return res.status(400).json({ error: "No idToken provided" });
 
-    // Verify Firebase ID token
+    // ✅ Use admin from firebase-admin
     const decoded = await admin.auth().verifyIdToken(idToken);
 
     // Generate your own JWT for backend
@@ -507,7 +487,6 @@ app.post("/api/auth/login", async (req, res) => {
     res.cookie("token", token, {
       httpOnly: true,
       secure: process.env.NODE_ENV === "production" ? true : false,
-
       sameSite: "lax",
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
@@ -829,8 +808,11 @@ app.put("/api/songs/:id", verifyToken, async (req, res) => {
   }
 });
 
+// Start server
+server.listen(PORT, () => {
+  console.log(`🔥 Server is running on port ${PORT}`);
+});
 // 🔌 Connect DB and start server
-const PORT = process.env.PORT || 5000;
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => {
@@ -838,4 +820,5 @@ mongoose
   })
   .catch((err) => console.error("❌ DB Connection Error:", err));
 
+// All secrets are loaded from process.env, nothing to change here.
 // All secrets are loaded from process.env, nothing to change here.
