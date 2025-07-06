@@ -74,6 +74,7 @@ const verifyToken = async (req, res, next) => {
       console.log("Token verification error:", err);
       return res.status(401).send({ message: "unauthorized access" });
     }
+    console.log("✅ JWT decoded:", decoded);
     req.user = decoded;
     next();
   });
@@ -136,25 +137,20 @@ app.post("/api/users", verifyToken, async (req, res) => {
 });
 
 app.get("/api/users/:uid", verifyToken, async (req, res) => {
-  try {
-    // Only allow user to access their own data
-    if (req.user?.uid !== req.params.uid) {
-      return res
-        .status(403)
-        .json({ error: "Forbidden: Cannot access another user's data" });
-    }
-    const user = await client
-      .db("music")
-      .collection("users")
-      .findOne({ uid: req.params.uid });
-    if (!user) return res.status(404).json({ error: "User not found" });
-    res.json({ user });
-  } catch (err) {
-    res
-      .status(400)
-      .json({ error: "Failed to fetch user", details: err.message });
+  if (req.user?.uid !== req.params.uid) {
+    return res
+      .status(403)
+      .json({ error: "Forbidden: Cannot access another user's data" });
   }
+
+  const user = await User.findOne({ uid: req.params.uid });
+  if (!user) {
+    return res.status(404).json({ error: "User not found" }); // <-- এখান থেকে আসছে
+  }
+
+  return res.json({ user });
 });
+
 
 // Song model (minimal, for demo)
 const songSchema = new mongoose.Schema({
