@@ -813,14 +813,14 @@ app.put("/api/songs/:id", verifyToken, async (req, res) => {
 server.listen(PORT, () => {
   console.log(`🔥 Server is running on port ${PORT}`);
 });
-// 🔌 Connect DB and start server
+// 🔌 Connect DB
 mongoose
   .connect(process.env.MONGO_URI)
-  .then(() => {
-    app.listen(PORT, () => console.log(`🔥 Server is running on port ${PORT}`));
-  })
   .catch((err) => console.error("❌ DB Connection Error:", err));
 
+// All secrets are loaded from process.env, nothing to change here.
+// All secrets are loaded from process.env, nothing to change here.
+// All secrets are loaded from process.env, nothing to change here.
 // All secrets are loaded from process.env, nothing to change here.
 // All secrets are loaded from process.env, nothing to change here.
 // All secrets are loaded from process.env, nothing to change here.
