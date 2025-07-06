@@ -11,7 +11,7 @@ const mongoose = require("mongoose");
 const app = express();
 const PORT = process.env.PORT || 5000;
 const multer = require("multer");
-const upload = multer({ storage: multer.memoryStorage() }); 
+const upload = multer({ storage: multer.memoryStorage() });
 
 // ✅ Add firebase-admin import and initialization
 const admin = require("firebase-admin");
@@ -30,7 +30,6 @@ const allowedOrigins = [
   "https://audiovibe-21bd8.firebaseapp.com",
 ];
 
-// Middleware
 app.use(
   cors({
     origin: function (origin, callback) {
@@ -41,7 +40,7 @@ app.use(
         return callback(new Error("Not allowed by CORS"));
       }
     },
-    credentials: true,
+    credentials: true, // ✅ VERY IMPORTANT
   })
 );
 app.use(express.json());
@@ -104,7 +103,9 @@ app.post("/api/users", verifyToken, async (req, res) => {
     if (!uid || !email)
       return res.status(400).json({ error: "uid and email required" });
     if (req.user?.uid !== uid) {
-      return res.status(403).json({ error: "Forbidden: Cannot modify another user's data" });
+      return res
+        .status(403)
+        .json({ error: "Forbidden: Cannot modify another user's data" });
     }
     const user = await client
       .db("music")
@@ -126,7 +127,9 @@ app.get("/api/users/:uid", verifyToken, async (req, res) => {
   try {
     // Only allow user to access their own data
     if (req.user?.uid !== req.params.uid) {
-      return res.status(403).json({ error: "Forbidden: Cannot access another user's data" });
+      return res
+        .status(403)
+        .json({ error: "Forbidden: Cannot access another user's data" });
     }
     const user = await client
       .db("music")
@@ -476,19 +479,17 @@ app.post("/api/auth/login", async (req, res) => {
     const { idToken } = req.body;
     if (!idToken) return res.status(400).json({ error: "No idToken provided" });
 
-    // ✅ Use admin from firebase-admin
     const decoded = await admin.auth().verifyIdToken(idToken);
 
-    // Generate your own JWT for backend
     const payload = { uid: decoded.uid, email: decoded.email };
     const token = jwt.sign(payload, jwtSecret, { expiresIn: "7d" });
 
-    // Set as httpOnly cookie
+    // ✅ Set cookie for cross-origin (Render/production)
     res.cookie("token", token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production" ? true : false,
-      sameSite: "lax",
-      maxAge: 7 * 24 * 60 * 60 * 1000,
+      secure: true, // ✅ Render এ HTTPS, তাই secure:true দরকার
+      sameSite: "None", // ✅ Cross-site cookie allow করার জন্য
+      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 দিন
     });
 
     res.json({ message: "JWT set", uid: decoded.uid });
@@ -820,5 +821,8 @@ mongoose
   })
   .catch((err) => console.error("❌ DB Connection Error:", err));
 
+// All secrets are loaded from process.env, nothing to change here.
+// All secrets are loaded from process.env, nothing to change here.
+// All secrets are loaded from process.env, nothing to change here.
 // All secrets are loaded from process.env, nothing to change here.
 // All secrets are loaded from process.env, nothing to change here.
