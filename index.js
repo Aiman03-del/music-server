@@ -518,7 +518,19 @@ app.post("/api/auth/login", async (req, res) => {
     res.status(401).json({ error: "Invalid Firebase token" });
   }
 });
+app.post("/jwt", (req, res) => {
+  const { email, uid } = req.body;
+  const token = jwt.sign({ email, uid }, jwtSecret, { expiresIn: "365d" });
 
+  res
+    .cookie("token", token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "None",
+      maxAge: 365 * 24 * 60 * 60 * 1000,
+    })
+    .send({ success: true, token });
+});
 // Activity model
 const activitySchema = new mongoose.Schema({
   uid: { type: String, required: true },
