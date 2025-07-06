@@ -95,6 +95,18 @@ app.get("/", (req, res) => {
   res.send("🎵 Audio Stream Server is Running!");
 });
 
+// User model (add this if not already defined)
+const userSchema = new mongoose.Schema({
+  uid: String,
+  email: String,
+  name: String,
+  image: String,
+  type: String,
+  createdAt: Date,
+  provider: String,
+});
+const User = mongoose.models.User || mongoose.model("User", userSchema);
+
 // User routes
 app.post("/api/users", verifyToken, async (req, res) => {
   try {
@@ -469,6 +481,7 @@ app.get("/api/playlists/top", async (req, res) => {
     const playlists = await Playlist.find().sort({ playCount: -1 }).limit(5);
     res.json(playlists);
   } catch (err) {
+    console.error("Failed to fetch top playlists:", err); // Add error logging
     res.status(500).json({ error: "Failed to fetch top playlists" });
   }
 });
@@ -811,6 +824,16 @@ app.put("/api/songs/:id", verifyToken, async (req, res) => {
     res
       .status(400)
       .json({ error: "Failed to update song", details: err.message });
+  }
+});
+
+// Add this route to return all users
+app.get("/api/users", async (req, res) => {
+  try {
+    const users = await User.find();
+    res.json({ users });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch users" });
   }
 });
 
