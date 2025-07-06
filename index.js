@@ -24,21 +24,24 @@ const app = express();
 
 const allowedOrigins = [
   "http://localhost:3000",
-  "http://localhost:5173", 
+  "http://localhost:5173",
+  "https://healers1.netlify.app",
 ];
 
 // 🛡️ Middleware
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    } else {
-      return callback(new Error("Not allowed by CORS"));
-    }
-  },
-  credentials: true,
-}));
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      } else {
+        return callback(new Error("Not allowed by CORS"));
+      }
+    },
+    credentials: true,
+  })
+);
 app.use(helmet());
 app.use(express.json());
 app.use(cookieParser());
@@ -90,20 +93,29 @@ const Song = mongoose.models.Song || mongoose.model("Song", songSchema);
 app.post("/api/songs", verifyToken, async (req, res) => {
   try {
     if (!req.user || !req.user.uid) {
-      return res.status(401).json({ error: "Unauthorized: No user in request" });
+      return res
+        .status(401)
+        .json({ error: "Unauthorized: No user in request" });
     }
     const { title, artist, genre, cover, audio, duration } = req.body;
     const song = new Song({
       title,
       artist,
-      genre: typeof genre === "string" ? genre.split(",").map(g => g.trim()) : genre,
+      genre:
+        typeof genre === "string"
+          ? genre.split(",").map((g) => g.trim())
+          : genre,
       cover,
       audio,
       duration: Number(duration),
     });
     await song.save();
     // Log activity for the user who added the song
-    await logActivity({ uid: req.user.uid, action: "Added song", meta: { songId: song._id, title } });
+    await logActivity({
+      uid: req.user.uid,
+      action: "Added song",
+      meta: { songId: song._id, title },
+    });
     res.status(201).json({ message: "Song added", song });
   } catch (err) {
     res.status(400).json({ error: "Failed to add song", details: err.message });
@@ -123,15 +135,15 @@ app.get("/api/songs", async (req, res) => {
 // Update a song (protected)
 app.put("/api/songs/:id", verifyToken, async (req, res) => {
   try {
-    const updated = await Song.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true }
-    );
+    const updated = await Song.findByIdAndUpdate(req.params.id, req.body, {
+      new: true,
+    });
     if (!updated) return res.status(404).json({ error: "Song not found" });
     res.json({ message: "Song updated", song: updated });
   } catch (err) {
-    res.status(400).json({ error: "Failed to update song", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to update song", details: err.message });
   }
 });
 
@@ -142,7 +154,9 @@ app.delete("/api/songs/:id", verifyToken, async (req, res) => {
     if (!deleted) return res.status(404).json({ error: "Song not found" });
     res.json({ message: "Song deleted" });
   } catch (err) {
-    res.status(400).json({ error: "Failed to delete song", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to delete song", details: err.message });
   }
 });
 
@@ -167,7 +181,9 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
     if (err && err.response && err.response.data) {
       console.error("ImageKit response data:", err.response.data);
     }
-    res.status(500).json({ error: "Image upload failed", details: err && err.message });
+    res
+      .status(500)
+      .json({ error: "Image upload failed", details: err && err.message });
   }
 });
 
@@ -183,13 +199,15 @@ app.post("/api/upload-audio", upload.single("file"), async (req, res) => {
     const uploadResponse = await imagekit.upload({
       file: req.file.buffer,
       fileName: req.file.originalname,
-      folder: "audio"
+      folder: "audio",
     });
 
     res.json({ url: uploadResponse.url });
   } catch (err) {
     console.error("Audio upload error:", err && (err.message || err));
-    res.status(500).json({ error: "Audio upload failed", details: err && err.message });
+    res
+      .status(500)
+      .json({ error: "Audio upload failed", details: err && err.message });
   }
 });
 
@@ -209,7 +227,8 @@ const User = mongoose.models.User || mongoose.model("User", userSchema);
 app.post("/api/users", async (req, res) => {
   try {
     const { uid, email, name, image, type, createdAt, provider } = req.body;
-    if (!uid || !email) return res.status(400).json({ error: "uid and email required" });
+    if (!uid || !email)
+      return res.status(400).json({ error: "uid and email required" });
 
     // Upsert user (update if exists, insert if not)
     const user = await User.findOneAndUpdate(
@@ -219,7 +238,9 @@ app.post("/api/users", async (req, res) => {
     );
     res.status(201).json({ message: "User saved", user });
   } catch (err) {
-    res.status(400).json({ error: "Failed to save user", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to save user", details: err.message });
   }
 });
 
@@ -230,7 +251,9 @@ app.get("/api/users/:uid", verifyToken, async (req, res) => {
     if (!user) return res.status(404).json({ error: "User not found" });
     res.json({ user });
   } catch (err) {
-    res.status(400).json({ error: "Failed to fetch user", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to fetch user", details: err.message });
   }
 });
 
@@ -252,15 +275,13 @@ app.put("/api/users/:uid/role", async (req, res) => {
     if (!["user", "staff", "admin"].includes(type)) {
       return res.status(400).json({ error: "Invalid role" });
     }
-    const user = await User.findOneAndUpdate(
-      { uid },
-      { type },
-      { new: true }
-    );
+    const user = await User.findOneAndUpdate({ uid }, { type }, { new: true });
     if (!user) return res.status(404).json({ error: "User not found" });
     res.json({ message: "Role updated", user });
   } catch (err) {
-    res.status(400).json({ error: "Failed to update role", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to update role", details: err.message });
   }
 });
 
@@ -273,18 +294,22 @@ const playlistSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   playCount: { type: Number, default: 0 },
 });
-const Playlist = mongoose.models.Playlist || mongoose.model("Playlist", playlistSchema);
+const Playlist =
+  mongoose.models.Playlist || mongoose.model("Playlist", playlistSchema);
 
 // Create Playlist (protected)
 app.post("/api/playlists", verifyToken, async (req, res) => {
   try {
     const { name, description, userId } = req.body;
-    if (!name || !userId) return res.status(400).json({ error: "name and userId required" });
+    if (!name || !userId)
+      return res.status(400).json({ error: "name and userId required" });
     const playlist = new Playlist({ name, description, userId, songs: [] });
     await playlist.save();
     res.status(201).json({ message: "Playlist created", id: playlist._id });
   } catch (err) {
-    res.status(400).json({ error: "Failed to create playlist", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to create playlist", details: err.message });
   }
 });
 
@@ -301,7 +326,11 @@ app.post("/api/playlists/:playlistId/add-song", async (req, res) => {
     ).populate("songs");
     if (!playlist) return res.status(404).json({ error: "Playlist not found" });
     // Log activity
-    await logActivity({ uid: playlist.userId, action: "Added song to playlist", meta: { playlistId, songId } });
+    await logActivity({
+      uid: playlist.userId,
+      action: "Added song to playlist",
+      meta: { playlistId, songId },
+    });
     res.json({ message: "Song added to playlist", playlist });
   } catch (err) {
     res.status(400).json({ error: "Failed to add song", details: err.message });
@@ -321,10 +350,16 @@ app.post("/api/playlists/:playlistId/remove-song", async (req, res) => {
     ).populate("songs");
     if (!playlist) return res.status(404).json({ error: "Playlist not found" });
     // Log activity
-    await logActivity({ uid: playlist.userId, action: "Removed song from playlist", meta: { playlistId, songId } });
+    await logActivity({
+      uid: playlist.userId,
+      action: "Removed song from playlist",
+      meta: { playlistId, songId },
+    });
     res.json({ message: "Song removed from playlist", playlist });
   } catch (err) {
-    res.status(400).json({ error: "Failed to remove song", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to remove song", details: err.message });
   }
 });
 
@@ -344,7 +379,7 @@ app.get("/api/playlists/:playlistId", async (req, res) => {
     const playlist = await Playlist.findById(req.params.playlistId).lean();
     if (!playlist) return res.status(404).json({ error: "Playlist not found" });
     // Populate songs array with song documents
-    const songIds = (playlist.songs || []).map(id => id.toString());
+    const songIds = (playlist.songs || []).map((id) => id.toString());
     const songs = await Song.find({ _id: { $in: songIds } });
     res.json({ ...playlist, songs });
   } catch (err) {
@@ -356,17 +391,22 @@ app.get("/api/playlists/:playlistId", async (req, res) => {
 app.put("/api/playlists/:playlistId/remove", async (req, res) => {
   try {
     const { songId } = req.body;
-    const playlist = await Playlist.findByIdAndUpdate(
-      req.params.playlistId,
-      { $pull: { songs: songId } }
-    );
+    const playlist = await Playlist.findByIdAndUpdate(req.params.playlistId, {
+      $pull: { songs: songId },
+    });
     // Log activity
     if (playlist) {
-      await logActivity({ uid: playlist.userId, action: "Removed song from playlist", meta: { playlistId: req.params.playlistId, songId } });
+      await logActivity({
+        uid: playlist.userId,
+        action: "Removed song from playlist",
+        meta: { playlistId: req.params.playlistId, songId },
+      });
     }
     res.json({ message: "Song removed from playlist" });
   } catch (err) {
-    res.status(400).json({ error: "Failed to remove song", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to remove song", details: err.message });
   }
 });
 
@@ -388,7 +428,11 @@ app.put("/api/playlists/:playlistId/add", async (req, res) => {
         await logActivity({
           uid: playlist.userId,
           action: isLiked ? "Liked a song" : "Added song to playlist",
-          meta: { playlistId: req.params.playlistId, songId, ...(isLiked && { liked: true }) }
+          meta: {
+            playlistId: req.params.playlistId,
+            songId,
+            ...(isLiked && { liked: true }),
+          },
         });
       }
       return res.json({ message: "Added successfully" });
@@ -403,22 +447,27 @@ app.put("/api/playlists/:playlistId/remove", async (req, res) => {
   try {
     const { songId } = req.body;
     const playlist = await Playlist.findById(req.params.playlistId);
-    await Playlist.findByIdAndUpdate(
-      req.params.playlistId,
-      { $pull: { songs: songId } }
-    );
+    await Playlist.findByIdAndUpdate(req.params.playlistId, {
+      $pull: { songs: songId },
+    });
     // Log activity
     if (playlist) {
       const isLiked = playlist.name === "Liked Songs";
       await logActivity({
         uid: playlist.userId,
         action: isLiked ? "Unliked a song" : "Removed song from playlist",
-        meta: { playlistId: req.params.playlistId, songId, ...(isLiked && { liked: true }) }
+        meta: {
+          playlistId: req.params.playlistId,
+          songId,
+          ...(isLiked && { liked: true }),
+        },
       });
     }
     res.json({ message: "Song removed from playlist" });
   } catch (err) {
-    res.status(400).json({ error: "Failed to remove song", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to remove song", details: err.message });
   }
 });
 
@@ -456,7 +505,8 @@ app.post("/api/auth/login", async (req, res) => {
     // Set as httpOnly cookie
     res.cookie("token", token, {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: process.env.NODE_ENV === "production" ? true : false,
+
       sameSite: "lax",
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
@@ -475,7 +525,8 @@ const activitySchema = new mongoose.Schema({
   meta: { type: Object, default: {} },
   createdAt: { type: Date, default: Date.now },
 });
-const Activity = mongoose.models.Activity || mongoose.model("Activity", activitySchema);
+const Activity =
+  mongoose.models.Activity || mongoose.model("Activity", activitySchema);
 
 // Helper to log activity
 async function logActivity({ uid, action, meta }) {
@@ -487,17 +538,22 @@ async function logActivity({ uid, action, meta }) {
 app.post("/api/activity", async (req, res) => {
   try {
     const { uid, action, meta } = req.body;
-    if (!uid || !action) return res.status(400).json({ error: "uid and action required" });
+    if (!uid || !action)
+      return res.status(400).json({ error: "uid and action required" });
     const activity = await Activity.create({ uid, action, meta });
     res.status(201).json({ message: "Activity logged", activity });
   } catch (err) {
-    res.status(400).json({ error: "Failed to log activity", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to log activity", details: err.message });
   }
 });
 
 app.get("/api/activity/user/:uid", async (req, res) => {
   try {
-    const activities = await Activity.find({ uid: req.params.uid }).sort({ createdAt: -1 }).limit(100);
+    const activities = await Activity.find({ uid: req.params.uid })
+      .sort({ createdAt: -1 })
+      .limit(100);
     res.json({ activities });
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch activities" });
@@ -510,7 +566,8 @@ app.get("/api/activity/user/:uid", async (req, res) => {
 app.post("/api/users", async (req, res) => {
   try {
     const { uid, email, name, image, type, createdAt, provider } = req.body;
-    if (!uid || !email) return res.status(400).json({ error: "uid and email required" });
+    if (!uid || !email)
+      return res.status(400).json({ error: "uid and email required" });
 
     // Upsert user (update if exists, insert if not)
     const user = await User.findOneAndUpdate(
@@ -519,10 +576,16 @@ app.post("/api/users", async (req, res) => {
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
     // Log activity
-    await logActivity({ uid, action: "Profile updated", meta: { name, image } });
+    await logActivity({
+      uid,
+      action: "Profile updated",
+      meta: { name, image },
+    });
     res.status(201).json({ message: "User saved", user });
   } catch (err) {
-    res.status(400).json({ error: "Failed to save user", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to save user", details: err.message });
   }
 });
 
@@ -530,14 +593,21 @@ app.post("/api/users", async (req, res) => {
 app.post("/api/playlists", verifyToken, async (req, res) => {
   try {
     const { name, description, userId } = req.body;
-    if (!name || !userId) return res.status(400).json({ error: "name and userId required" });
+    if (!name || !userId)
+      return res.status(400).json({ error: "name and userId required" });
     const playlist = new Playlist({ name, description, userId, songs: [] });
     await playlist.save();
     // Log activity
-    await logActivity({ uid: userId, action: "Created playlist", meta: { name, playlistId: playlist._id } });
+    await logActivity({
+      uid: userId,
+      action: "Created playlist",
+      meta: { name, playlistId: playlist._id },
+    });
     res.status(201).json({ message: "Playlist created", id: playlist._id });
   } catch (err) {
-    res.status(400).json({ error: "Failed to create playlist", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to create playlist", details: err.message });
   }
 });
 
@@ -554,7 +624,11 @@ app.post("/api/playlists/:playlistId/add-song", async (req, res) => {
     ).populate("songs");
     if (!playlist) return res.status(404).json({ error: "Playlist not found" });
     // Log activity
-    await logActivity({ uid: playlist.userId, action: "Added song to playlist", meta: { playlistId, songId } });
+    await logActivity({
+      uid: playlist.userId,
+      action: "Added song to playlist",
+      meta: { playlistId, songId },
+    });
     res.json({ message: "Song added to playlist", playlist });
   } catch (err) {
     res.status(400).json({ error: "Failed to add song", details: err.message });
@@ -574,10 +648,16 @@ app.post("/api/playlists/:playlistId/remove-song", async (req, res) => {
     ).populate("songs");
     if (!playlist) return res.status(404).json({ error: "Playlist not found" });
     // Log activity
-    await logActivity({ uid: playlist.userId, action: "Removed song from playlist", meta: { playlistId, songId } });
+    await logActivity({
+      uid: playlist.userId,
+      action: "Removed song from playlist",
+      meta: { playlistId, songId },
+    });
     res.json({ message: "Song removed from playlist", playlist });
   } catch (err) {
-    res.status(400).json({ error: "Failed to remove song", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to remove song", details: err.message });
   }
 });
 
@@ -585,17 +665,22 @@ app.post("/api/playlists/:playlistId/remove-song", async (req, res) => {
 app.put("/api/playlists/:playlistId/remove", async (req, res) => {
   try {
     const { songId } = req.body;
-    const playlist = await Playlist.findByIdAndUpdate(
-      req.params.playlistId,
-      { $pull: { songs: songId } }
-    );
+    const playlist = await Playlist.findByIdAndUpdate(req.params.playlistId, {
+      $pull: { songs: songId },
+    });
     // Log activity
     if (playlist) {
-      await logActivity({ uid: playlist.userId, action: "Removed song from playlist", meta: { playlistId: req.params.playlistId, songId } });
+      await logActivity({
+        uid: playlist.userId,
+        action: "Removed song from playlist",
+        meta: { playlistId: req.params.playlistId, songId },
+      });
     }
     res.json({ message: "Song removed from playlist" });
   } catch (err) {
-    res.status(400).json({ error: "Failed to remove song", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to remove song", details: err.message });
   }
 });
 
@@ -617,7 +702,11 @@ app.put("/api/playlists/:playlistId/add", async (req, res) => {
         await logActivity({
           uid: playlist.userId,
           action: isLiked ? "Liked a song" : "Added song to playlist",
-          meta: { playlistId: req.params.playlistId, songId, ...(isLiked && { liked: true }) }
+          meta: {
+            playlistId: req.params.playlistId,
+            songId,
+            ...(isLiked && { liked: true }),
+          },
         });
       }
       return res.json({ message: "Added successfully" });
@@ -633,16 +722,22 @@ app.delete("/api/playlists/:playlistId", verifyToken, async (req, res) => {
     const playlistId = req.params.playlistId;
     const userId = req.query.uid;
     const playlist = await Playlist.findById(playlistId);
-    if (!playlist) return res.status(404).json({ error: 'Playlist not found' });
+    if (!playlist) return res.status(404).json({ error: "Playlist not found" });
     if (playlist.userId !== userId) {
-      return res.status(403).json({ error: 'Not authorized to delete this playlist' });
+      return res
+        .status(403)
+        .json({ error: "Not authorized to delete this playlist" });
     }
     await Playlist.deleteOne({ _id: playlistId });
     // Log activity
-    await logActivity({ uid: userId, action: "Deleted playlist", meta: { playlistId } });
-    res.json({ message: 'Playlist deleted successfully' });
+    await logActivity({
+      uid: userId,
+      action: "Deleted playlist",
+      meta: { playlistId },
+    });
+    res.json({ message: "Playlist deleted successfully" });
   } catch (err) {
-    res.status(500).json({ error: 'Failed to delete playlist' });
+    res.status(500).json({ error: "Failed to delete playlist" });
   }
 });
 
@@ -657,17 +752,15 @@ app.put("/api/users/:uid/role", async (req, res) => {
     if (!["user", "staff", "admin"].includes(type)) {
       return res.status(400).json({ error: "Invalid role" });
     }
-    const user = await User.findOneAndUpdate(
-      { uid },
-      { type },
-      { new: true }
-    );
+    const user = await User.findOneAndUpdate({ uid }, { type }, { new: true });
     if (!user) return res.status(404).json({ error: "User not found" });
     // Log activity (admin action)
     await logActivity({ uid, action: "Role updated", meta: { newRole: type } });
     res.json({ message: "Role updated", user });
   } catch (err) {
-    res.status(400).json({ error: "Failed to update role", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to update role", details: err.message });
   }
 });
 
@@ -678,7 +771,10 @@ app.post("/api/songs", verifyToken, async (req, res) => {
     const song = new Song({
       title,
       artist,
-      genre: typeof genre === "string" ? genre.split(",").map(g => g.trim()) : genre,
+      genre:
+        typeof genre === "string"
+          ? genre.split(",").map((g) => g.trim())
+          : genre,
       cover,
       audio,
       duration: Number(duration),
@@ -686,7 +782,11 @@ app.post("/api/songs", verifyToken, async (req, res) => {
     await song.save();
     // Log activity
     if (req.user?.uid) {
-      await logActivity({ uid: req.user.uid, action: "Added song", meta: { songId: song._id, title } });
+      await logActivity({
+        uid: req.user.uid,
+        action: "Added song",
+        meta: { songId: song._id, title },
+      });
     }
     res.status(201).json({ message: "Song added", song });
   } catch (err) {
@@ -696,19 +796,23 @@ app.post("/api/songs", verifyToken, async (req, res) => {
 
 app.put("/api/songs/:id", verifyToken, async (req, res) => {
   try {
-    const updated = await Song.findByIdAndUpdate(
-      req.params.id,
-      req.body,
-      { new: true }
-    );
+    const updated = await Song.findByIdAndUpdate(req.params.id, req.body, {
+      new: true,
+    });
     if (!updated) return res.status(404).json({ error: "Song not found" });
     // Log activity
     if (req.user?.uid) {
-      await logActivity({ uid: req.user.uid, action: "Updated song", meta: { songId: req.params.id } });
+      await logActivity({
+        uid: req.user.uid,
+        action: "Updated song",
+        meta: { songId: req.params.id },
+      });
     }
     res.json({ message: "Song updated", song: updated });
   } catch (err) {
-    res.status(400).json({ error: "Failed to update song", details: err.message });
+    res
+      .status(400)
+      .json({ error: "Failed to update song", details: err.message });
   }
 });
 
