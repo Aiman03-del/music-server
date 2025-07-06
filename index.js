@@ -476,28 +476,33 @@ app.get("/api/playlists/top", async (req, res) => {
 // Firebase Auth to Backend JWT bridge
 app.post("/api/auth/login", async (req, res) => {
   try {
-    const { idToken } = req.body;
-    if (!idToken) return res.status(400).json({ error: "No idToken provided" });
-
+    const idToken = req.body.idToken;
     const decoded = await admin.auth().verifyIdToken(idToken);
 
-    const payload = { uid: decoded.uid, email: decoded.email };
-    const token = jwt.sign(payload, jwtSecret, { expiresIn: "7d" });
+    const token = jwt.sign(
+      {
+        uid: decoded.uid,
+        email: decoded.email,
+      },
+      process.env.JWT_SECRET || "dev_secret",
+      { expiresIn: "7d" }
+    );
 
-    // ✅ Set cookie for cross-origin (Render/production)
+    // ✅ ✅ ✅ CRITICAL COOKIE CONFIG
     res.cookie("token", token, {
       httpOnly: true,
-      secure: true, // ✅ Render এ HTTPS, তাই secure:true দরকার
-      sameSite: "None", // ✅ Cross-site cookie allow করার জন্য
-      maxAge: 7 * 24 * 60 * 60 * 1000, // 7 দিন
+      secure: true,
+      sameSite: "None",
+      maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    res.json({ message: "JWT set", uid: decoded.uid });
+    return res.json({ message: "JWT set in cookie" });
   } catch (err) {
-    console.error("JWT bridge error:", err);
-    res.status(401).json({ error: "Invalid Firebase token" });
+    console.error("Login error:", err);
+    return res.status(401).json({ error: "Unauthorized" });
   }
 });
+
 app.post("/jwt", (req, res) => {
   const { email, uid } = req.body;
   const token = jwt.sign({ email, uid }, jwtSecret, { expiresIn: "365d" });
@@ -817,12 +822,3 @@ server.listen(PORT, () => {
 mongoose
   .connect(process.env.MONGO_URI)
   .catch((err) => console.error("❌ DB Connection Error:", err));
-
-// All secrets are loaded from process.env, nothing to change here.
-// All secrets are loaded from process.env, nothing to change here.
-// All secrets are loaded from process.env, nothing to change here.
-// All secrets are loaded from process.env, nothing to change here.
-// All secrets are loaded from process.env, nothing to change here.
-// All secrets are loaded from process.env, nothing to change here.
-// All secrets are loaded from process.env, nothing to change here.
-// All secrets are loaded from process.env, nothing to change here.
