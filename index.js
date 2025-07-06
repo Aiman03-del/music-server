@@ -9,24 +9,16 @@ const cookieParser = require("cookie-parser");
 const jwt = require("jsonwebtoken");
 const { getAuth } = require("firebase-admin/auth");
 const path = require("path");
+const serviceAccount = require(path.join(__dirname, "serviceAccountKey.json"));
 const admin = require("firebase-admin");
-
-dotenv.config();
-
-// Add this block to decode and parse the service account from env
-let serviceAccount;
-if (process.env.FIREBASE_SERVICE_ACCOUNT_BASE64) {
-  const decoded = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_BASE64, "base64").toString("utf-8");
-  serviceAccount = JSON.parse(decoded);
-} else {
-  throw new Error("FIREBASE_SERVICE_ACCOUNT_BASE64 env variable not set");
-}
 
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert(serviceAccount),
   });
 }
+
+dotenv.config();
 
 const app = express();
 
@@ -728,3 +720,5 @@ mongoose
     app.listen(PORT, () => console.log(`🔥 Server is running on port ${PORT}`));
   })
   .catch((err) => console.error("❌ DB Connection Error:", err));
+
+// All secrets are loaded from process.env, nothing to change here.
