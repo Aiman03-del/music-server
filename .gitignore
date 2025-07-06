@@ -1,0 +1,12 @@
+# Ignore environment variables
+.env
+
+# Firebase or Google Cloud credentials
+serviceAccountKey.json
+
+# Node modules
+node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
