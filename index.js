@@ -12,6 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 const multer = require("multer");
 const upload = multer({ storage: multer.memoryStorage() });
+const ImageKit = require("imagekit");
 
 // ✅ Add firebase-admin import and initialization
 const admin = require("firebase-admin");
@@ -21,6 +22,13 @@ if (!admin.apps.length) {
     credential: admin.credential.cert(serviceAccount),
   });
 }
+
+// Initialize ImageKit
+const imagekit = new ImageKit({
+  publicKey: process.env.IMAGEKIT_PUBLIC_KEY,
+  privateKey: process.env.IMAGEKIT_PRIVATE_KEY,
+  urlEndpoint: process.env.IMAGEKIT_URL_ENDPOINT,
+});
 
 // ✅ Define allowedOrigins before using in CORS middleware
 const allowedOrigins = [
@@ -243,6 +251,7 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Only image files are allowed" });
     }
 
+    // Use imagekit instance here
     const uploadResponse = await imagekit.upload({
       file: req.file.buffer,
       fileName: req.file.originalname,
@@ -270,6 +279,7 @@ app.post("/api/upload-audio", upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "Only audio files are allowed" });
     }
 
+    // Use imagekit instance here
     const uploadResponse = await imagekit.upload({
       file: req.file.buffer,
       fileName: req.file.originalname,
