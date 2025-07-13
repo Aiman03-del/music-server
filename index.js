@@ -66,6 +66,16 @@ client
   .then(() => console.log("✅ MongoDB connected"))
   .catch((err) => console.error("❌ MongoDB connection error:", err));
 
+// --- Always use "healers" DB for mongoose ---
+mongoose.connection.on("connected", () => {
+  // Switch to "healers" DB if not already
+  if (mongoose.connection.name !== "healers") {
+    mongoose.connection.useDb("healers");
+  }
+});
+mongoose.set("strictQuery", false);
+mongoose.connect(process.env.MONGO_URI + "/healers"); // force DB
+
 // JWT secret
 const jwtSecret = process.env.JWT_SECRET || "your_jwt_secret_here";
 
@@ -99,6 +109,25 @@ const io = new Server(server, {
   },
 });
 
+// --- SOCKET.IO REALTIME EVENTS ---
+// Emit to all clients when a song is added, updated, or deleted
+function emitSongsUpdate() {
+  Song.find()
+    .sort({ _id: -1 })
+    .then((songs) => {
+      io.emit("songs:update", songs);
+    });
+}
+
+// Emit to all clients when users are updated (role change, etc)
+function emitUsersUpdate() {
+  const db = mongoose.connection.useDb("healers");
+  const UserModel = db.models.User || db.model("User", userSchema);
+  UserModel.find().then((users) => {
+    io.emit("users:update", users);
+  });
+}
+
 // Routes
 app.get("/", (req, res) => {
   res.send("🎵 Audio Stream Server is Running!");
@@ -128,8 +157,9 @@ app.post("/api/users", verifyToken, async (req, res) => {
         .status(403)
         .json({ error: "Forbidden: Cannot modify another user's data" });
     }
+    // Always use "healers" DB
     const user = await client
-      .db("test")
+      .db("healers")
       .collection("users")
       .findOneAndUpdate(
         { uid },
@@ -145,20 +175,27 @@ app.post("/api/users", verifyToken, async (req, res) => {
 });
 
 app.get("/api/users/:uid", verifyToken, async (req, res) => {
-  if (req.user?.uid !== req.params.uid) {
-    return res
-      .status(403)
-      .json({ error: "Forbidden: Cannot access another user's data" });
+  try {
+    if (req.user?.uid !== req.params.uid) {
+      return res
+        .status(403)
+        .json({ error: "Forbidden: Cannot access another user's data" });
+    }
+    // Always use "healers" DB
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    const user = await UserModel.findOne({ uid: req.params.uid });
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    return res.json({ user });
+  } catch (err) {
+    console.error("Error in GET /api/users/:uid:", err);
+    res
+      .status(500)
+      .json({ error: "Internal server error", details: err.message });
   }
-
-  const user = await User.findOne({ uid: req.params.uid });
-  if (!user) {
-    return res.status(404).json({ error: "User not found" }); // <-- এখান থেকে আসছে
-  }
-
-  return res.json({ user });
 });
-
 
 // Song model (minimal, for demo)
 const songSchema = new mongoose.Schema({
@@ -167,47 +204,69 @@ const songSchema = new mongoose.Schema({
   genre: [String],
   cover: String,
   audio: String,
-  duration: Number,
 });
-const Song = mongoose.models.Song || mongoose.model("Song", songSchema);
+const Song =
+  mongoose.connection.useDb("healers").models.Song ||
+  mongoose.connection.useDb("healers").model("Song", songSchema);
 
 // API route to add a song (protected)
 app.post("/api/songs", verifyToken, async (req, res) => {
   try {
-    if (!req.user || !req.user.uid) {
-      return res
-        .status(401)
-        .json({ error: "Unauthorized: No user in request" });
+    const { title, artist, genre, cover, audio } = req.body; // remove duration
+
+    // Improved validation
+    const errors = [];
+    if (!title?.trim()) errors.push("Title is required");
+    if (!artist?.trim()) errors.push("Artist is required");
+    if (!genre || !Array.isArray(genre)) errors.push("Genre must be an array");
+    if (!cover?.trim()) errors.push("Cover URL is required");
+    if (!audio?.trim()) errors.push("Audio URL is required");
+
+    if (errors.length > 0) {
+      return res.status(400).json({ error: errors.join(", ") });
     }
-    const { title, artist, genre, cover, audio, duration } = req.body;
+
     const song = new Song({
-      title,
-      artist,
-      genre:
-        typeof genre === "string"
-          ? genre.split(",").map((g) => g.trim())
-          : genre,
+      title: title.trim(),
+      artist: artist.trim(),
+      genre: Array.isArray(genre) ? genre : [genre],
       cover,
       audio,
-      duration: Number(duration),
+      // duration: req.body.duration, // Remove duration from model
     });
+
     await song.save();
-    // Log activity for the user who added the song
+
+    // Log activity
     await logActivity({
       uid: req.user.uid,
       action: "Added song",
       meta: { songId: song._id, title },
     });
+    emitSongsUpdate(); // <-- realtime update
     res.status(201).json({ message: "Song added", song });
   } catch (err) {
-    res.status(400).json({ error: "Failed to add song", details: err.message });
+    console.error("Server error in /api/songs:", err);
+    res.status(500).json({ error: "Server error", details: err.message });
   }
 });
 
-// API route to get all songs (public)
+// API route to get all songs (public) - sorted by playCount descending
 app.get("/api/songs", async (req, res) => {
   try {
-    const songs = await Song.find().sort({ _id: -1 });
+    const { q } = req.query;
+    let filter = {};
+    if (q && q.trim()) {
+      const regex = new RegExp(q.trim(), "i");
+      filter = {
+        $or: [
+          { title: regex },
+          { artist: regex },
+          { genre: { $elemMatch: { $regex: regex } } },
+        ],
+      };
+    }
+    const songs = await Song.find(filter).sort({ playCount: -1, _id: -1 });
     res.json({ songs });
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch songs" });
@@ -217,10 +276,28 @@ app.get("/api/songs", async (req, res) => {
 // Update a song (protected)
 app.put("/api/songs/:id", verifyToken, async (req, res) => {
   try {
-    const updated = await Song.findByIdAndUpdate(req.params.id, req.body, {
+    // Remove duration from update
+    const { title, artist, genre, cover, audio } = req.body;
+    const updateData = {
+      title,
+      artist,
+      genre,
+      cover,
+      audio,
+    };
+    const updated = await Song.findByIdAndUpdate(req.params.id, updateData, {
       new: true,
     });
     if (!updated) return res.status(404).json({ error: "Song not found" });
+    emitSongsUpdate(); // <-- realtime update
+    // Log activity
+    if (req.user?.uid) {
+      await logActivity({
+        uid: req.user.uid,
+        action: "Updated song",
+        meta: { songId: req.params.id },
+      });
+    }
     res.json({ message: "Song updated", song: updated });
   } catch (err) {
     res
@@ -234,6 +311,7 @@ app.delete("/api/songs/:id", verifyToken, async (req, res) => {
   try {
     const deleted = await Song.findByIdAndDelete(req.params.id);
     if (!deleted) return res.status(404).json({ error: "Song not found" });
+    emitSongsUpdate(); // <-- realtime update
     res.json({ message: "Song deleted" });
   } catch (err) {
     res
@@ -295,7 +373,6 @@ app.post("/api/upload-audio", upload.single("file"), async (req, res) => {
   }
 });
 
-// Playlist model (update structure)
 const playlistSchema = new mongoose.Schema({
   name: { type: String, required: true },
   description: { type: String, default: "" },
@@ -304,8 +381,9 @@ const playlistSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
   playCount: { type: Number, default: 0 },
 });
-const Playlist =
-  mongoose.models.Playlist || mongoose.model("Playlist", playlistSchema);
+
+const db = mongoose.connection.useDb("healers");
+const Playlist = db.models.Playlist || db.model("Playlist", playlistSchema);
 
 // Create Playlist (protected)
 app.post("/api/playlists", verifyToken, async (req, res) => {
@@ -481,17 +559,6 @@ app.put("/api/playlists/:playlistId/remove", async (req, res) => {
   }
 });
 
-// Get Top Played Playlists
-app.get("/api/playlists/top", async (req, res) => {
-  try {
-    const playlists = await Playlist.find().sort({ playCount: -1 }).limit(5);
-    res.json(playlists);
-  } catch (err) {
-    console.error("Failed to fetch top playlists:", err); // Add error logging
-    res.status(500).json({ error: "Failed to fetch top playlists" });
-  }
-});
-
 // Firebase Auth to Backend JWT bridge
 app.post("/api/auth/login", async (req, res) => {
   try {
@@ -507,7 +574,26 @@ app.post("/api/auth/login", async (req, res) => {
       { expiresIn: "7d" }
     );
 
-    // ✅ ✅ ✅ CRITICAL COOKIE CONFIG
+    // Save or update user in DB
+    // You may want to extract more fields from decoded or request if available
+    const userData = {
+      uid: decoded.uid,
+      email: decoded.email,
+      name: decoded.name || "",
+      image: decoded.picture || "",
+      type: "user",
+      createdAt: new Date(),
+      provider: decoded.firebase?.sign_in_provider || "google",
+    };
+
+    // Upsert user in MongoDB
+    const user = await mongoose.models.User.findOneAndUpdate(
+      { uid: userData.uid },
+      userData,
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    // Set JWT in cookie
     res.cookie("token", token, {
       httpOnly: true,
       secure: true,
@@ -515,7 +601,12 @@ app.post("/api/auth/login", async (req, res) => {
       maxAge: 7 * 24 * 60 * 60 * 1000,
     });
 
-    return res.json({ message: "JWT set in cookie" });
+    // Return JWT and user data
+    return res.json({
+      message: "JWT set in cookie",
+      token,
+      user,
+    });
   } catch (err) {
     console.error("Login error:", err);
     return res.status(401).json({ error: "Unauthorized" });
@@ -535,6 +626,7 @@ app.post("/jwt", (req, res) => {
     })
     .send({ success: true, token });
 });
+
 // Activity model
 const activitySchema = new mongoose.Schema({
   uid: { type: String, required: true },
@@ -542,12 +634,17 @@ const activitySchema = new mongoose.Schema({
   meta: { type: Object, default: {} },
   createdAt: { type: Date, default: Date.now },
 });
-const Activity =
-  mongoose.models.Activity || mongoose.model("Activity", activitySchema);
+
+// Helper to always get Activity model from the correct db context
+function getActivityModel() {
+  const db = mongoose.connection.useDb("healers");
+  return db.models.Activity || db.model("Activity", activitySchema);
+}
 
 // Helper to log activity
 async function logActivity({ uid, action, meta }) {
   if (!uid || !action) return;
+  const Activity = getActivityModel();
   await Activity.create({ uid, action, meta });
 }
 
@@ -557,6 +654,7 @@ app.post("/api/activity", async (req, res) => {
     const { uid, action, meta } = req.body;
     if (!uid || !action)
       return res.status(400).json({ error: "uid and action required" });
+    const Activity = getActivityModel();
     const activity = await Activity.create({ uid, action, meta });
     res.status(201).json({ message: "Activity logged", activity });
   } catch (err) {
@@ -568,6 +666,7 @@ app.post("/api/activity", async (req, res) => {
 
 app.get("/api/activity/user/:uid", async (req, res) => {
   try {
+    const Activity = getActivityModel();
     const activities = await Activity.find({ uid: req.params.uid })
       .sort({ createdAt: -1 })
       .limit(100);
@@ -769,11 +868,31 @@ app.put("/api/users/:uid/role", async (req, res) => {
     if (!["user", "staff", "admin"].includes(type)) {
       return res.status(400).json({ error: "Invalid role" });
     }
-    const user = await User.findOneAndUpdate({ uid }, { type }, { new: true });
+    // Always use "healers" DB for user update
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    const user = await UserModel.findOneAndUpdate(
+      { uid },
+      { type },
+      { new: true }
+    );
     if (!user) return res.status(404).json({ error: "User not found" });
-    // Log activity (admin action)
     await logActivity({ uid, action: "Role updated", meta: { newRole: type } });
-    res.json({ message: "Role updated", user });
+    emitUsersUpdate();
+    console.log("User role updated in DB:", user);
+    res.json({
+      message: "Role updated",
+      user,
+      info: {
+        uid: user.uid,
+        name: user.name,
+        email: user.email,
+        type: user.type,
+        image: user.image,
+        provider: user.provider,
+        createdAt: user.createdAt,
+      },
+    });
   } catch (err) {
     res
       .status(400)
@@ -784,7 +903,7 @@ app.put("/api/users/:uid/role", async (req, res) => {
 // Song add/update
 app.post("/api/songs", verifyToken, async (req, res) => {
   try {
-    const { title, artist, genre, cover, audio, duration } = req.body;
+    const { title, artist, genre, cover, audio } = req.body;
     const song = new Song({
       title,
       artist,
@@ -794,7 +913,6 @@ app.post("/api/songs", verifyToken, async (req, res) => {
           : genre,
       cover,
       audio,
-      duration: Number(duration),
     });
     await song.save();
     // Log activity
@@ -805,6 +923,7 @@ app.post("/api/songs", verifyToken, async (req, res) => {
         meta: { songId: song._id, title },
       });
     }
+    emitSongsUpdate(); // <-- realtime update
     res.status(201).json({ message: "Song added", song });
   } catch (err) {
     res.status(400).json({ error: "Failed to add song", details: err.message });
@@ -813,10 +932,20 @@ app.post("/api/songs", verifyToken, async (req, res) => {
 
 app.put("/api/songs/:id", verifyToken, async (req, res) => {
   try {
-    const updated = await Song.findByIdAndUpdate(req.params.id, req.body, {
+    // Remove duration from update
+    const { title, artist, genre, cover, audio } = req.body;
+    const updateData = {
+      title,
+      artist,
+      genre,
+      cover,
+      audio,
+    };
+    const updated = await Song.findByIdAndUpdate(req.params.id, updateData, {
       new: true,
     });
     if (!updated) return res.status(404).json({ error: "Song not found" });
+    emitSongsUpdate(); // <-- realtime update
     // Log activity
     if (req.user?.uid) {
       await logActivity({
@@ -833,13 +962,101 @@ app.put("/api/songs/:id", verifyToken, async (req, res) => {
   }
 });
 
+// Increment playCount
+app.post("/api/songs/:id/play", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const song = await Song.findByIdAndUpdate(
+      id,
+      { $inc: { playCount: 1 } },
+      { new: true }
+    );
+    if (!song) return res.status(404).json({ error: "Song not found" });
+    res.json({ message: "Play count updated", song });
+  } catch (err) {
+    res
+      .status(500)
+      .json({ error: "Failed to update play count", details: err.message });
+  }
+});
+
 // Add this route to return all users
 app.get("/api/users", async (req, res) => {
   try {
-    const users = await User.find();
+    // Always use "healers" DB
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    const users = await UserModel.find();
     res.json({ users });
   } catch (err) {
-    res.status(500).json({ error: "Failed to fetch users" });
+    console.error("Failed to fetch users:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to fetch users", details: err.message });
+  }
+});
+
+// Fetch multiple songs by IDs (for "Songs For You" suggestions)
+app.post("/api/songs/by-ids", async (req, res) => {
+  try {
+    const { ids } = req.body;
+    if (!Array.isArray(ids) || ids.length === 0) {
+      return res.status(400).json({ error: "ids array required" });
+    }
+    // Convert string IDs to ObjectId
+    const objectIds = ids.map((id) => mongoose.Types.ObjectId(id));
+    const songs = await Song.find({ _id: { $in: objectIds } });
+    res.json({ songs });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch songs by ids" });
+  }
+});
+
+// Increment playlist playCount
+app.put("/api/playlists/:playlistId/increment-play", async (req, res) => {
+  try {
+    const { playlistId } = req.params;
+    const playlist = await Playlist.findByIdAndUpdate(
+      playlistId,
+      { $inc: { playCount: 1 } },
+      { new: true }
+    );
+    if (!playlist) return res.status(404).json({ error: "Playlist not found" });
+    res.json({ message: "Play count updated", playlist });
+  } catch (err) {
+    res
+      .status(500)
+      .json({ error: "Failed to increment play count", details: err.message });
+  }
+});
+
+// Delete user from Firebase and MongoDB
+app.delete("/api/users/:uid", async (req, res) => {
+  const { uid } = req.params;
+  try {
+    // Delete from Firebase
+    await admin.auth().deleteUser(uid);
+
+    // Delete from MongoDB
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    const user = await UserModel.findOneAndDelete({ uid });
+
+    // Log activity
+    await logActivity({
+      uid,
+      action: "Deleted user",
+      meta: { deletedBy: req.user?.uid || "admin" },
+    });
+
+    emitUsersUpdate();
+
+    res.json({ message: "User deleted from Firebase and DB", user });
+  } catch (err) {
+    console.error("Failed to delete user:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to delete user", details: err.message });
   }
 });
 
@@ -849,5 +1066,5 @@ server.listen(PORT, () => {
 });
 // 🔌 Connect DB
 mongoose
-  .connect(process.env.MONGO_URI)
+  .connect(process.env.MONGO_URI + "/healers")
   .catch((err) => console.error("❌ DB Connection Error:", err));
