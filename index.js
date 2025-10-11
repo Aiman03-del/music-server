@@ -109,6 +109,27 @@ const io = new Server(server, {
   },
 });
 
+// Socket.IO connection handler
+io.on("connection", (socket) => {
+  console.log("🔌 User connected:", socket.id);
+  
+  // Join user's personal room for notifications
+  socket.on("join:user", (userId) => {
+    socket.join(userId);
+    console.log(`✅ User ${userId} joined their room`);
+  });
+  
+  // Leave user room
+  socket.on("leave:user", (userId) => {
+    socket.leave(userId);
+    console.log(`👋 User ${userId} left their room`);
+  });
+  
+  socket.on("disconnect", () => {
+    console.log("❌ User disconnected:", socket.id);
+  });
+});
+
 // --- SOCKET.IO REALTIME EVENTS ---
 // Emit to all clients when a song is added, updated, or deleted
 function emitSongsUpdate() {
@@ -133,7 +154,7 @@ app.get("/", (req, res) => {
   res.send("🎵 Audio Stream Server is Running!");
 });
 
-// User model (add this if not already defined)
+// User model with preferences
 const userSchema = new mongoose.Schema({
   uid: String,
   email: String,
@@ -142,6 +163,13 @@ const userSchema = new mongoose.Schema({
   type: String,
   createdAt: Date,
   provider: String,
+  preferences: {
+    favoriteGenres: [String],
+    favoriteArtists: [String],
+    moods: [String],
+    listeningHabits: String,
+    onboardingCompleted: { type: Boolean, default: false },
+  },
 });
 const User = mongoose.models.User || mongoose.model("User", userSchema);
 
@@ -197,13 +225,15 @@ app.get("/api/users/:uid", verifyToken, async (req, res) => {
   }
 });
 
-// Song model (minimal, for demo)
+// Song model with playCount
 const songSchema = new mongoose.Schema({
   title: String,
   artist: String,
   genre: [String],
   cover: String,
   audio: String,
+  playCount: { type: Number, default: 0 },
+  createdAt: { type: Date, default: Date.now },
 });
 const Song =
   mongoose.connection.useDb("healers").models.Song ||
@@ -270,6 +300,45 @@ app.get("/api/songs", async (req, res) => {
     res.json({ songs });
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch songs" });
+  }
+});
+
+// API route to get trending songs (most played)
+app.get("/api/songs/trending", async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 6;
+    // Get songs with highest playCount, minimum 1 play
+    const songs = await Song.find({ playCount: { $gte: 1 } })
+      .sort({ playCount: -1, _id: -1 })
+      .limit(limit);
+    
+    // If not enough songs with plays, fill with recent songs
+    if (songs.length < limit) {
+      const remaining = limit - songs.length;
+      const recentSongs = await Song.find({ 
+        _id: { $nin: songs.map(s => s._id) } 
+      })
+        .sort({ createdAt: -1 })
+        .limit(remaining);
+      songs.push(...recentSongs);
+    }
+    
+    res.json({ songs });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch trending songs" });
+  }
+});
+
+// API route to get new releases
+app.get("/api/songs/new-releases", async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 6;
+    const songs = await Song.find()
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit);
+    res.json({ songs });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch new releases" });
   }
 });
 
@@ -380,10 +449,34 @@ const playlistSchema = new mongoose.Schema({
   songs: [{ type: mongoose.Schema.Types.ObjectId, ref: "Song" }],
   createdAt: { type: Date, default: Date.now },
   playCount: { type: Number, default: 0 },
+  isPublic: { type: Boolean, default: false },
+  sharedWith: [{ type: String }], // Array of user IDs who have access
 });
 
 const db = mongoose.connection.useDb("healers");
 const Playlist = db.models.Playlist || db.model("Playlist", playlistSchema);
+
+// Invitation Schema
+const invitationSchema = new mongoose.Schema({
+  playlistId: { type: mongoose.Schema.Types.ObjectId, ref: "Playlist", required: true },
+  fromUserId: { type: String, required: true }, // Who sent the invitation
+  toUserId: { type: String, required: true }, // Who receives the invitation
+  status: { type: String, enum: ["pending", "accepted", "rejected"], default: "pending" },
+  createdAt: { type: Date, default: Date.now },
+});
+const Invitation = db.models.Invitation || db.model("Invitation", invitationSchema);
+
+// Notification Schema
+const notificationSchema = new mongoose.Schema({
+  userId: { type: String, required: true }, // Who receives this notification
+  type: { type: String, required: true }, // "playlist_invitation", "invitation_accepted", etc.
+  title: { type: String, required: true },
+  message: { type: String, required: true },
+  isRead: { type: Boolean, default: false },
+  metadata: { type: Object, default: {} }, // Extra data (playlistId, fromUser, etc.)
+  createdAt: { type: Date, default: Date.now },
+});
+const Notification = db.models.Notification || db.model("Notification", notificationSchema);
 
 // Create Playlist (protected)
 app.post("/api/playlists", verifyToken, async (req, res) => {
@@ -860,6 +953,104 @@ app.delete("/api/playlists/:playlistId", verifyToken, async (req, res) => {
 // Like/Unlike (handled as add/remove song from "Liked Songs" playlist)
 // Already covered above with add/remove song from playlist
 
+// Update user preferences
+app.put("/api/users/:uid/preferences", async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const { favoriteGenres, favoriteArtists, moods, listeningHabits } = req.body;
+    
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    
+    const user = await UserModel.findOneAndUpdate(
+      { uid },
+      {
+        $set: {
+          preferences: {
+            favoriteGenres: favoriteGenres || [],
+            favoriteArtists: favoriteArtists || [],
+            moods: moods || [],
+            listeningHabits: listeningHabits || "",
+            onboardingCompleted: true,
+          },
+        },
+      },
+      { new: true }
+    );
+    
+    if (!user) return res.status(404).json({ error: "User not found" });
+    
+    await logActivity({
+      uid,
+      action: "Completed onboarding",
+      meta: { preferences: { favoriteGenres, favoriteArtists, moods, listeningHabits } },
+    });
+    
+    res.json({ message: "Preferences saved", user });
+  } catch (err) {
+    res.status(400).json({ error: "Failed to save preferences", details: err.message });
+  }
+});
+
+// Get personalized recommendations for user
+app.get("/api/recommendations/:uid", async (req, res) => {
+  try {
+    const { uid } = req.params;
+    const limit = parseInt(req.query.limit) || 10;
+    
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    const user = await UserModel.findOne({ uid });
+    
+    if (!user || !user.preferences || !user.preferences.onboardingCompleted) {
+      // Return trending songs if no preferences
+      const songs = await Song.find()
+        .sort({ playCount: -1, createdAt: -1 })
+        .limit(limit);
+      return res.json({ songs, personalized: false });
+    }
+    
+    const { favoriteGenres, favoriteArtists } = user.preferences;
+    
+    // Build query based on preferences
+    let query = {};
+    const conditions = [];
+    
+    if (favoriteGenres && favoriteGenres.length > 0) {
+      conditions.push({ genre: { $in: favoriteGenres } });
+    }
+    
+    if (favoriteArtists && favoriteArtists.length > 0) {
+      conditions.push({ artist: { $in: favoriteArtists } });
+    }
+    
+    if (conditions.length > 0) {
+      query = { $or: conditions };
+    }
+    
+    // Get songs matching preferences, sorted by playCount
+    const songs = await Song.find(query)
+      .sort({ playCount: -1, createdAt: -1 })
+      .limit(limit);
+    
+    // If not enough songs, fill with popular songs from preferred genres
+    if (songs.length < limit && favoriteGenres && favoriteGenres.length > 0) {
+      const remaining = limit - songs.length;
+      const additionalSongs = await Song.find({
+        genre: { $in: favoriteGenres },
+        _id: { $nin: songs.map(s => s._id) },
+      })
+        .sort({ playCount: -1 })
+        .limit(remaining);
+      songs.push(...additionalSongs);
+    }
+    
+    res.json({ songs, personalized: true });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to get recommendations" });
+  }
+});
+
 // Admin: Update user role
 app.put("/api/users/:uid/role", async (req, res) => {
   try {
@@ -1027,6 +1218,315 @@ app.put("/api/playlists/:playlistId/increment-play", async (req, res) => {
     res
       .status(500)
       .json({ error: "Failed to increment play count", details: err.message });
+  }
+});
+
+// ========== PLAYLIST SHARING SYSTEM ==========
+
+// Toggle playlist public/private
+app.put("/api/playlists/:playlistId/toggle-public", verifyToken, async (req, res) => {
+  try {
+    const { playlistId } = req.params;
+    const playlist = await Playlist.findById(playlistId);
+    
+    if (!playlist) return res.status(404).json({ error: "Playlist not found" });
+    
+    // Check if user owns this playlist
+    if (playlist.userId !== req.user.uid) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+    
+    playlist.isPublic = !playlist.isPublic;
+    await playlist.save();
+    
+    await logActivity({
+      uid: req.user.uid,
+      action: playlist.isPublic ? "Made playlist public" : "Made playlist private",
+      meta: { playlistId, name: playlist.name },
+    });
+    
+    res.json({ 
+      message: `Playlist is now ${playlist.isPublic ? 'public' : 'private'}`, 
+      isPublic: playlist.isPublic 
+    });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to toggle visibility" });
+  }
+});
+
+// Send playlist invitation to a user
+app.post("/api/playlists/:playlistId/invite", verifyToken, async (req, res) => {
+  try {
+    const { playlistId } = req.params;
+    const { toUserEmail } = req.body;
+    
+    if (!toUserEmail) {
+      return res.status(400).json({ error: "User email is required" });
+    }
+    
+    const playlist = await Playlist.findById(playlistId);
+    if (!playlist) return res.status(404).json({ error: "Playlist not found" });
+    
+    // Check if sender owns this playlist
+    if (playlist.userId !== req.user.uid) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+    
+    // Find the user to invite
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    const toUser = await UserModel.findOne({ email: toUserEmail });
+    
+    if (!toUser) {
+      return res.status(404).json({ error: "User not found" });
+    }
+    
+    // Check if already shared
+    if (playlist.sharedWith.includes(toUser.uid)) {
+      return res.status(400).json({ error: "Playlist already shared with this user" });
+    }
+    
+    // Check if invitation already exists
+    const existingInvite = await Invitation.findOne({
+      playlistId,
+      toUserId: toUser.uid,
+      status: "pending",
+    });
+    
+    if (existingInvite) {
+      return res.status(400).json({ error: "Invitation already sent" });
+    }
+    
+    // Create invitation
+    const invitation = await Invitation.create({
+      playlistId,
+      fromUserId: req.user.uid,
+      toUserId: toUser.uid,
+    });
+    
+    // Create notification for the recipient
+    const fromUser = await UserModel.findOne({ uid: req.user.uid });
+    const notification = await Notification.create({
+      userId: toUser.uid,
+      type: "playlist_invitation",
+      title: "New Playlist Invitation",
+      message: `${fromUser.name || fromUser.email} invited you to "${playlist.name}"`,
+      metadata: {
+        invitationId: invitation._id,
+        playlistId,
+        playlistName: playlist.name,
+        fromUserId: req.user.uid,
+        fromUserName: fromUser.name || fromUser.email,
+      },
+    });
+    
+    // Emit real-time notification via Socket.io
+    io.to(toUser.uid).emit("notification:new", notification);
+    
+    res.json({ 
+      message: "Invitation sent successfully", 
+      invitation,
+      notification 
+    });
+  } catch (err) {
+    console.error("Invitation error:", err);
+    res.status(500).json({ error: "Failed to send invitation" });
+  }
+});
+
+// Accept playlist invitation
+app.put("/api/invitations/:invitationId/accept", verifyToken, async (req, res) => {
+  try {
+    const { invitationId } = req.params;
+    const invitation = await Invitation.findById(invitationId);
+    
+    if (!invitation) {
+      return res.status(404).json({ error: "Invitation not found" });
+    }
+    
+    // Check if user is the recipient
+    if (invitation.toUserId !== req.user.uid) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+    
+    if (invitation.status !== "pending") {
+      return res.status(400).json({ error: "Invitation already processed" });
+    }
+    
+    // Update invitation status
+    invitation.status = "accepted";
+    await invitation.save();
+    
+    // Add user to playlist's sharedWith array
+    await Playlist.findByIdAndUpdate(invitation.playlistId, {
+      $addToSet: { sharedWith: req.user.uid },
+    });
+    
+    // Create notification for playlist owner
+    const playlist = await Playlist.findById(invitation.playlistId);
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    const acceptedUser = await UserModel.findOne({ uid: req.user.uid });
+    
+    const notification = await Notification.create({
+      userId: invitation.fromUserId,
+      type: "invitation_accepted",
+      title: "Invitation Accepted",
+      message: `${acceptedUser.name || acceptedUser.email} accepted your playlist invitation`,
+      metadata: {
+        playlistId: invitation.playlistId,
+        playlistName: playlist.name,
+        acceptedByUserId: req.user.uid,
+        acceptedByUserName: acceptedUser.name || acceptedUser.email,
+      },
+    });
+    
+    // Emit real-time notification
+    io.to(invitation.fromUserId).emit("notification:new", notification);
+    
+    // Mark the invitation notification as read
+    await Notification.updateMany(
+      { 
+        userId: req.user.uid,
+        "metadata.invitationId": invitationId 
+      },
+      { isRead: true }
+    );
+    
+    res.json({ message: "Invitation accepted", invitation });
+  } catch (err) {
+    console.error("Accept invitation error:", err);
+    res.status(500).json({ error: "Failed to accept invitation" });
+  }
+});
+
+// Reject playlist invitation
+app.put("/api/invitations/:invitationId/reject", verifyToken, async (req, res) => {
+  try {
+    const { invitationId } = req.params;
+    const invitation = await Invitation.findById(invitationId);
+    
+    if (!invitation) {
+      return res.status(404).json({ error: "Invitation not found" });
+    }
+    
+    if (invitation.toUserId !== req.user.uid) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+    
+    invitation.status = "rejected";
+    await invitation.save();
+    
+    // Mark notification as read
+    await Notification.updateMany(
+      { 
+        userId: req.user.uid,
+        "metadata.invitationId": invitationId 
+      },
+      { isRead: true }
+    );
+    
+    res.json({ message: "Invitation rejected", invitation });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to reject invitation" });
+  }
+});
+
+// Get user's notifications
+app.get("/api/notifications/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const notifications = await Notification.find({ userId })
+      .sort({ createdAt: -1 })
+      .limit(50);
+    
+    const unreadCount = await Notification.countDocuments({ 
+      userId, 
+      isRead: false 
+    });
+    
+    res.json({ notifications, unreadCount });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch notifications" });
+  }
+});
+
+// Mark notification as read
+app.put("/api/notifications/:notificationId/read", async (req, res) => {
+  try {
+    const { notificationId } = req.params;
+    await Notification.findByIdAndUpdate(notificationId, { isRead: true });
+    res.json({ message: "Notification marked as read" });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to mark notification as read" });
+  }
+});
+
+// Mark all notifications as read for a user
+app.put("/api/notifications/user/:userId/read-all", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    await Notification.updateMany({ userId }, { isRead: true });
+    res.json({ message: "All notifications marked as read" });
+  } catch (err) {
+    res.status(500).json({ error: "Failed to mark all as read" });
+  }
+});
+
+// Get playlists shared with user
+app.get("/api/playlists/shared/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const sharedPlaylists = await Playlist.find({ 
+      sharedWith: userId 
+    });
+    res.json(sharedPlaylists);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch shared playlists" });
+  }
+});
+
+// Get public playlists (for discovery)
+app.get("/api/playlists/public/all", async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 20;
+    const publicPlaylists = await Playlist.find({ isPublic: true })
+      .sort({ playCount: -1, createdAt: -1 })
+      .limit(limit);
+    res.json(publicPlaylists);
+  } catch (err) {
+    res.status(500).json({ error: "Failed to fetch public playlists" });
+  }
+});
+
+// Get trending public playlists (most played)
+app.get("/api/playlists/public/trending", async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit) || 6;
+    // Get public playlists with highest playCount, with at least 1 song
+    const playlists = await Playlist.find({ 
+      isPublic: true,
+      $expr: { $gt: [{ $size: "$songs" }, 0] } // At least 1 song
+    })
+      .sort({ playCount: -1, createdAt: -1 })
+      .limit(limit);
+    
+    // Populate first song for each playlist (for cover image)
+    const playlistsWithCovers = await Promise.all(
+      playlists.map(async (pl) => {
+        const playlistObj = pl.toObject();
+        if (playlistObj.songs && playlistObj.songs.length > 0) {
+          const firstSong = await Song.findById(playlistObj.songs[0]);
+          playlistObj.firstSongCover = firstSong?.cover || null;
+        }
+        return playlistObj;
+      })
+    );
+    
+    res.json({ playlists: playlistsWithCovers });
+  } catch (err) {
+    console.error("Failed to fetch trending playlists:", err);
+    res.status(500).json({ error: "Failed to fetch trending playlists" });
   }
 });
 
