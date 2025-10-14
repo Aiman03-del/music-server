@@ -303,30 +303,8 @@ app.get("/api/songs", async (req, res) => {
   }
 });
 
-// Get single song details by ID
-app.get("/api/songs/:id", async (req, res) => {
-  try {
-    const song = await Song.findById(req.params.id);
-    if (!song) return res.status(404).json({ error: "Song not found" });
-    
-    // Get similar songs (same genre or artist)
-    const similarSongs = await Song.find({
-      $or: [
-        { genre: { $in: song.genre } },
-        { artist: song.artist }
-      ],
-      _id: { $ne: song._id } // Exclude current song
-    })
-      .sort({ playCount: -1 })
-      .limit(6);
-    
-    res.json({ song, similarSongs });
-  } catch (err) {
-    res.status(500).json({ error: "Failed to fetch song details" });
-  }
-});
-
 // API route to get trending songs (most played)
+// ⚠️ IMPORTANT: Must be BEFORE /api/songs/:id to avoid route conflict
 app.get("/api/songs/trending", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 6;
@@ -348,11 +326,13 @@ app.get("/api/songs/trending", async (req, res) => {
     
     res.json({ songs });
   } catch (err) {
-    res.status(500).json({ error: "Failed to fetch trending songs" });
+    console.error("Error fetching trending songs:", err);
+    res.status(500).json({ error: "Failed to fetch trending songs", details: err.message });
   }
 });
 
 // API route to get new releases
+// ⚠️ IMPORTANT: Must be BEFORE /api/songs/:id to avoid route conflict
 app.get("/api/songs/new-releases", async (req, res) => {
   try {
     const limit = parseInt(req.query.limit) || 6;
@@ -361,7 +341,33 @@ app.get("/api/songs/new-releases", async (req, res) => {
       .limit(limit);
     res.json({ songs });
   } catch (err) {
-    res.status(500).json({ error: "Failed to fetch new releases" });
+    console.error("Error fetching new releases:", err);
+    res.status(500).json({ error: "Failed to fetch new releases", details: err.message });
+  }
+});
+
+// Get single song details by ID
+// ⚠️ IMPORTANT: Must be AFTER specific routes like /trending and /new-releases
+app.get("/api/songs/:id", async (req, res) => {
+  try {
+    const song = await Song.findById(req.params.id);
+    if (!song) return res.status(404).json({ error: "Song not found" });
+    
+    // Get similar songs (same genre or artist)
+    const similarSongs = await Song.find({
+      $or: [
+        { genre: { $in: song.genre } },
+        { artist: song.artist }
+      ],
+      _id: { $ne: song._id } // Exclude current song
+    })
+      .sort({ playCount: -1 })
+      .limit(6);
+    
+    res.json({ song, similarSongs });
+  } catch (err) {
+    console.error("Error fetching song details:", err);
+    res.status(500).json({ error: "Failed to fetch song details", details: err.message });
   }
 });
 
