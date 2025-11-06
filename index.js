@@ -60,7 +60,7 @@ const client = new MongoClient(process.env.MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
   serverApi: ServerApiVersion.v1,
-});
+}); 
 client
   .connect()
   .then(() => console.log("✅ MongoDB connected"))
@@ -87,12 +87,32 @@ const verifyToken = async (req, res, next) => {
   if (!token) {
     return res.status(401).send({ message: "unauthorized access" });
   }
-  jwt.verify(token, jwtSecret, (err, decoded) => {
+  
+  jwt.verify(token, jwtSecret, async (err, decoded) => {
     if (err) {
       console.log("Token verification error:", err);
       return res.status(401).send({ message: "unauthorized access" });
     }
     console.log("✅ JWT decoded:", decoded);
+    
+    // If type is not in JWT, fetch from database
+    if (!decoded.type && decoded.uid) {
+      try {
+        const db = mongoose.connection.useDb("healers");
+        const UserModel = db.models.User || db.model("User", userSchema);
+        const dbUser = await UserModel.findOne({ uid: decoded.uid }).lean();
+        if (dbUser) {
+          decoded.type = dbUser.type || "user";
+          console.log(`✅ User type fetched from DB: ${decoded.type}`);
+        } else {
+          decoded.type = "user"; // Default
+        }
+      } catch (dbErr) {
+        console.error("Error fetching user type from DB:", dbErr);
+        decoded.type = decoded.type || "user"; // Fallback
+      }
+    }
+    
     req.user = decoded;
     next();
   });
@@ -102,7 +122,15 @@ const verifyToken = async (req, res, next) => {
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: {
-    origin: "*",
+    origin: function (origin, callback) {
+      // Allow requests with no origin (like mobile apps or curl requests)
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      } else {
+        return callback(new Error("Not allowed by CORS"));
+      }
+    },
     methods: ["GET", "POST"],
     allowedHeaders: ["my-custom-header"],
     credentials: true,
@@ -113,10 +141,34 @@ const io = new Server(server, {
 io.on("connection", (socket) => {
   console.log("🔌 User connected:", socket.id);
   
-  // Join user's personal room for notifications
-  socket.on("join:user", (userId) => {
+  // Join user's personal room for notifications and chat
+  socket.on("join:user", async (userId) => {
+    // Check if user is admin and join admin room
+    try {
+      const db = mongoose.connection.useDb("healers");
+      const UserModel = db.models.User || db.model("User", userSchema);
+      const user = await UserModel.findOne({ uid: userId }).lean();
+      if (user && user.type === "admin") {
+        socket.join("admin:all"); // Join admin room for receiving all messages
+        console.log(`👑 Admin ${userId} joined admin room`);
+      }
+    } catch (err) {
+      console.error("Error checking user type:", err);
+    }
     socket.join(userId);
     console.log(`✅ User ${userId} joined their room`);
+  });
+  
+  // Join chat room
+  socket.on("join:chat", (chatId) => {
+    socket.join(chatId);
+    console.log(`✅ Socket ${socket.id} joined chat ${chatId}`);
+  });
+  
+  // Leave chat room
+  socket.on("leave:chat", (chatId) => {
+    socket.leave(chatId);
+    console.log(`👋 Socket ${socket.id} left chat ${chatId}`);
   });
   
   // Leave user room
@@ -507,6 +559,39 @@ const notificationSchema = new mongoose.Schema({
 });
 const Notification = db.models.Notification || db.model("Notification", notificationSchema);
 
+// Chat Schema - Represents a conversation between a user/staff and admin
+const chatSchema = new mongoose.Schema({
+  userId: { type: String, required: true }, // User or staff who initiated the chat
+  adminId: { type: String, default: null }, // Admin who is handling the chat
+  lastMessage: { type: String, default: "" },
+  lastMessageAt: { type: Date, default: Date.now },
+  unreadCount: { type: Number, default: 0 }, // Unread messages for admin
+  status: { type: String, enum: ["active", "closed"], default: "active" },
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+});
+const Chat = db.models.Chat || db.model("Chat", chatSchema);
+
+// Message Schema - Individual messages in a chat
+const messageSchema = new mongoose.Schema({
+  chatId: { type: mongoose.Schema.Types.ObjectId, ref: "Chat", required: true },
+  senderId: { type: String, required: true }, // User ID who sent the message
+  senderType: { type: String, enum: ["user", "staff", "admin"], required: true },
+  message: { type: String, default: "" },
+  // Music request fields
+  isRequest: { type: Boolean, default: false }, // Is this a music addition request?
+  requestData: {
+    songName: { type: String, default: "" },
+    artistName: { type: String, default: "" },
+    movieName: { type: String, default: "" },
+    youtubeLink: { type: String, default: "" },
+    status: { type: String, enum: ["pending", "approved", "rejected", "added"], default: "pending" },
+  },
+  isRead: { type: Boolean, default: false },
+  createdAt: { type: Date, default: Date.now },
+});
+const Message = db.models.Message || db.model("Message", messageSchema);
+
 // Create Playlist (protected)
 app.post("/api/playlists", verifyToken, async (req, res) => {
   try {
@@ -687,32 +772,52 @@ app.post("/api/auth/login", async (req, res) => {
     const idToken = req.body.idToken;
     const decoded = await admin.auth().verifyIdToken(idToken);
 
+    // Check if user exists in DB first to preserve their type
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    const existingUser = await UserModel.findOne({ uid: decoded.uid }).lean();
+
+    // If user exists, preserve their type; otherwise default to "user"
+    const userType = existingUser?.type || "user";
+
+    // Update user data - preserve existing type for existing users
+    const updateData = {
+      email: decoded.email,
+      name: decoded.name || existingUser?.name || "",
+      image: decoded.picture || existingUser?.image || "",
+      provider: decoded.firebase?.sign_in_provider || existingUser?.provider || "google",
+    };
+
+    // Upsert user in MongoDB
+    // For existing users: only update email, name, image, provider (preserve type)
+    // For new users: set type to "user" and createdAt
+    const user = await UserModel.findOneAndUpdate(
+      { uid: decoded.uid },
+      {
+        $set: updateData,
+        $setOnInsert: {
+          type: "user", // Only set type to "user" if user is new
+          createdAt: new Date(),
+        },
+      },
+      { upsert: true, new: true }
+    );
+
+    // Ensure type is preserved for existing users (in case $setOnInsert didn't work)
+    if (existingUser && existingUser.type && user.type !== existingUser.type) {
+      user.type = existingUser.type;
+      await user.save();
+    }
+
+    // Create JWT with user type from database
     const token = jwt.sign(
       {
         uid: decoded.uid,
         email: decoded.email,
+        type: user.type || "user",
       },
       process.env.JWT_SECRET || "dev_secret",
       { expiresIn: "7d" }
-    );
-
-    // Save or update user in DB
-    // You may want to extract more fields from decoded or request if available
-    const userData = {
-      uid: decoded.uid,
-      email: decoded.email,
-      name: decoded.name || "",
-      image: decoded.picture || "",
-      type: "user",
-      createdAt: new Date(),
-      provider: decoded.firebase?.sign_in_provider || "google",
-    };
-
-    // Upsert user in MongoDB
-    const user = await mongoose.models.User.findOneAndUpdate(
-      { uid: userData.uid },
-      userData,
-      { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
     // Set JWT in cookie
@@ -735,9 +840,19 @@ app.post("/api/auth/login", async (req, res) => {
   }
 });
 
-app.post("/jwt", (req, res) => {
+app.post("/jwt", async (req, res) => {
   const { email, uid } = req.body;
-  const token = jwt.sign({ email, uid }, jwtSecret, { expiresIn: "365d" });
+  
+  // Get user type from database
+  const db = mongoose.connection.useDb("healers");
+  const UserModel = db.models.User || db.model("User", userSchema);
+  const user = await UserModel.findOne({ uid }).lean();
+  
+  const token = jwt.sign(
+    { email, uid, type: user?.type || "user" },
+    jwtSecret,
+    { expiresIn: "365d" }
+  );
 
   res
     .cookie("token", token, {
@@ -1216,6 +1331,112 @@ app.get("/api/users", async (req, res) => {
   }
 });
 
+// Get all admins
+app.get("/api/admins", async (req, res) => {
+  try {
+    // Always use "healers" DB
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    const admins = await UserModel.find({ type: "admin" }).lean();
+    
+    console.log(`📋 Found ${admins.length} admins`);
+    
+    // Return only necessary fields
+    const adminList = admins.map(admin => ({
+      uid: admin.uid,
+      name: admin.name || "",
+      email: admin.email || "",
+      image: admin.image || "",
+      type: admin.type || "admin",
+      createdAt: admin.createdAt,
+      updatedAt: admin.updatedAt,
+    }));
+    
+    res.json({ 
+      success: true,
+      count: adminList.length,
+      admins: adminList 
+    });
+  } catch (err) {
+    console.error("Failed to fetch admins:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to fetch admins", details: err.message });
+  }
+});
+
+// Search users and staff (for admin to start chat)
+// Search all logged-in users/staff (users who exist in database)
+app.get("/api/users/search", verifyToken, async (req, res) => {
+  try {
+    // Only admin can search users
+    if (req.user.type !== "admin") {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+    
+    const { q } = req.query; // Search query
+    console.log(`🔍 Search request received: "${q}"`);
+    
+    if (!q || q.trim().length < 2) {
+      return res.json({ success: true, count: 0, users: [] });
+    }
+    
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    
+    const searchTerm = q.trim().toLowerCase();
+    console.log(`🔍 Searching for: "${searchTerm}"`);
+    
+    // Get all logged-in users/staff (all users who exist in database)
+    const allUsers = await UserModel.find({
+      type: { $in: ["user", "staff"] }
+    }).lean();
+    
+    console.log(`📊 Total users/staff in database: ${allUsers.length}`);
+    
+    // Filter by search term - search in name or email (case-insensitive partial match)
+    const matchingUsers = allUsers.filter(user => {
+      const name = (user.name || "").toLowerCase().trim();
+      const email = (user.email || "").toLowerCase().trim();
+      
+      const nameMatch = name.includes(searchTerm);
+      const emailMatch = email.includes(searchTerm);
+      
+      if (nameMatch || emailMatch) {
+        console.log(`✅ Match found: ${user.name || user.email} (name: ${nameMatch}, email: ${emailMatch})`);
+      }
+      
+      return nameMatch || emailMatch;
+    });
+    
+    console.log(`📋 Found ${matchingUsers.length} matching users`);
+    
+    // Limit results
+    const limitedUsers = matchingUsers.slice(0, 20);
+    
+    const userList = limitedUsers.map(user => ({
+      uid: user.uid,
+      name: user.name || user.email || "",
+      email: user.email || "",
+      image: user.image || "",
+      type: user.type || "user",
+    }));
+    
+    console.log(`🔍 Search "${q}" returning ${userList.length} users`);
+    
+    res.json({ 
+      success: true,
+      count: userList.length,
+      users: userList 
+    });
+  } catch (err) {
+    console.error("❌ Failed to search users:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to search users", details: err.message });
+  }
+});
+
 // Fetch multiple songs by IDs (for "Songs For You" suggestions)
 app.post("/api/songs/by-ids", async (req, res) => {
   try {
@@ -1586,6 +1807,422 @@ app.delete("/api/users/:uid", async (req, res) => {
     res
       .status(500)
       .json({ error: "Failed to delete user", details: err.message });
+  }
+});
+
+// ========== CHAT SYSTEM ==========
+
+// Create or get chat for user/staff (they can only have one active chat with admin)
+// Admin can also create chat with specific user by passing userId in body
+app.post("/api/chat/create", verifyToken, async (req, res) => {
+  try {
+    const userType = req.user.type || "user";
+    let userId = req.user.uid;
+    
+    // If admin is creating chat, use userId from body
+    if (userType === "admin" && req.body.userId) {
+      userId = req.body.userId;
+    }
+    
+    if (!userId) {
+      return res.status(400).json({ error: "userId is required" });
+    }
+    
+    // Check if user already has an active chat
+    let chat = await Chat.findOne({ userId, status: "active" });
+    
+    if (!chat) {
+      // Get first available admin
+      const db = mongoose.connection.useDb("healers");
+      const UserModel = db.models.User || db.model("User", userSchema);
+      const firstAdmin = await UserModel.findOne({ type: "admin" }).lean();
+      const adminId = firstAdmin ? firstAdmin.uid : null;
+      
+      // Create new chat with adminId if admin exists
+      chat = await Chat.create({
+        userId,
+        adminId: adminId,
+        status: "active",
+      });
+      
+      console.log(`✅ Created new chat ${chat._id} with adminId: ${adminId} for userId: ${userId}`);
+    } else if (!chat.adminId) {
+      // If chat exists but adminId is null, assign first admin
+      const db = mongoose.connection.useDb("healers");
+      const UserModel = db.models.User || db.model("User", userSchema);
+      const firstAdmin = await UserModel.findOne({ type: "admin" }).lean();
+      if (firstAdmin) {
+        chat.adminId = firstAdmin.uid;
+        await chat.save();
+        console.log(`✅ Assigned admin ${firstAdmin.uid} to existing chat ${chat._id}`);
+      }
+    }
+    
+    res.json({ chat });
+  } catch (err) {
+    console.error("Create chat error:", err);
+    res.status(500).json({ error: "Failed to create chat", details: err.message });
+  }
+});
+
+// Send message (user/staff can send requests, admin can send regular messages)
+app.post("/api/chat/message", verifyToken, async (req, res) => {
+  try {
+    const { chatId, message, isRequest, requestData } = req.body;
+    const senderId = req.user.uid;
+    const senderType = req.user.type === "admin" ? "admin" : (req.user.type === "staff" ? "staff" : "user");
+    
+    console.log(`💬 Message send request - Sender: ${senderId} (${senderType}), ChatId: ${chatId}`);
+    
+    if (!chatId) {
+      return res.status(400).json({ error: "chatId is required" });
+    }
+    
+    // Verify chat exists
+    const chat = await Chat.findById(chatId);
+    if (!chat) {
+      console.error(`❌ Chat not found: ${chatId}`);
+      return res.status(404).json({ error: "Chat not found" });
+    }
+    
+    console.log(`✅ Chat found: ${chat._id}, UserId: ${chat.userId}, Status: ${chat.status}`);
+    
+    // If user/staff sending, ensure it's their chat
+    if (senderType !== "admin" && chat.userId !== senderId) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+    
+    // If adminId is null, assign first available admin
+    if (!chat.adminId) {
+      const db = mongoose.connection.useDb("healers");
+      const UserModel = db.models.User || db.model("User", userSchema);
+      const firstAdmin = await UserModel.findOne({ type: "admin" }).lean();
+      if (firstAdmin) {
+        chat.adminId = firstAdmin.uid;
+        await chat.save();
+        console.log(`✅ Assigned admin ${firstAdmin.uid} to chat ${chat._id}`);
+      }
+    }
+    
+    // If admin sending, set adminId if not set (use current admin)
+    if (senderType === "admin" && !chat.adminId) {
+      chat.adminId = senderId;
+      await chat.save();
+    }
+    
+    // Validate request data if it's a request
+    if (isRequest && requestData) {
+      if (!requestData.songName?.trim() || !requestData.artistName?.trim()) {
+        return res.status(400).json({ 
+          error: "Song name and artist name are required for music requests" 
+        });
+      }
+    }
+    
+    // Create message
+    const newMessage = await Message.create({
+      chatId,
+      senderId,
+      senderType,
+      message: message || "",
+      isRequest: isRequest || false,
+      requestData: isRequest && requestData ? {
+        songName: requestData.songName?.trim() || "",
+        artistName: requestData.artistName?.trim() || "",
+        movieName: requestData.movieName?.trim() || "", // Optional
+        youtubeLink: requestData.youtubeLink?.trim() || "", // Optional
+        status: "pending",
+      } : undefined,
+      isRead: senderType === "admin" ? true : false, // Admin messages are auto-read
+    });
+    
+    // Update chat last message
+    const messageText = isRequest 
+      ? `Music Request: ${requestData?.songName || "New request"}`
+      : message || "";
+    
+    chat.lastMessage = messageText;
+    chat.lastMessageAt = new Date();
+    chat.updatedAt = new Date();
+    
+    // Increment unread count if message is from user/staff
+    if (senderType !== "admin") {
+      chat.unreadCount = (chat.unreadCount || 0) + 1;
+      console.log(`📊 Updated unread count: ${chat.unreadCount} for chat ${chat._id}`);
+    } else {
+      // If admin replied, reset unread count for user
+      chat.unreadCount = 0;
+    }
+    
+    await chat.save();
+    console.log(`✅ Chat updated - Last message: "${messageText}", Unread: ${chat.unreadCount}`);
+    
+    // Emit real-time message via Socket.IO
+    const populatedMessage = await Message.findById(newMessage._id).lean();
+    // Convert chatId to string for consistency
+    const chatIdStr = chatId.toString();
+    const chatIdObjStr = chat._id.toString();
+    
+    // Ensure chatId in message is string
+    populatedMessage.chatId = chatIdStr;
+    
+    // Emit to chat room
+    io.to(chatIdStr).emit("chat:message", populatedMessage);
+    // Also emit to user room
+    io.to(chat.userId).emit("chat:message", populatedMessage);
+    // Emit to all admins via admin room (all admins receive messages)
+    io.to("admin:all").emit("chat:message:admin", populatedMessage);
+    // Also emit globally for backward compatibility
+    io.emit("chat:message:admin", populatedMessage);
+    // Emit to all admins for new chats
+    io.to("admin:all").emit("chat:new", { chatId: chatIdObjStr, userId: chat.userId });
+    io.emit("chat:new", { chatId: chatIdObjStr, userId: chat.userId });
+    
+    res.json({ message: populatedMessage, chat });
+  } catch (err) {
+    console.error("Send message error:", err);
+    res.status(500).json({ error: "Failed to send message", details: err.message });
+  }
+});
+
+// Get all chats for admin (conversations list)
+app.get("/api/chat/admin/conversations", verifyToken, async (req, res) => {
+  try {
+    console.log("📋 Admin conversations request - User:", req.user);
+    console.log("📋 User type:", req.user.type);
+    
+    if (req.user.type !== "admin") {
+      console.error("❌ Access denied - User type is not admin:", req.user.type);
+      return res.status(403).json({ error: "Admin access required" });
+    }
+    
+    console.log("📋 Admin requesting conversations list");
+    
+    const chats = await Chat.find({ status: "active" })
+      .sort({ lastMessageAt: -1 })
+      .limit(100);
+    
+    console.log(`📋 Found ${chats.length} active chats`);
+    
+    if (chats.length === 0) {
+      console.log("⚠️ No active chats found in database");
+    }
+    
+    // Populate user info for each chat
+    const UserModel = db.models.User || db.model("User", userSchema);
+    const conversations = await Promise.all(
+      chats.map(async (chat) => {
+        const user = await UserModel.findOne({ uid: chat.userId }).lean();
+        console.log(`📋 Chat ${chat._id} - User: ${chat.userId}, Last message: ${chat.lastMessage}`);
+        return {
+          ...chat.toObject(),
+          user: user ? {
+            uid: user.uid,
+            name: user.name,
+            email: user.email,
+            image: user.image,
+            type: user.type,
+          } : null,
+        };
+      })
+    );
+    
+    console.log(`📋 Returning ${conversations.length} conversations`);
+    res.json({ conversations });
+  } catch (err) {
+    console.error("Get conversations error:", err);
+    res.status(500).json({ error: "Failed to get conversations", details: err.message });
+  }
+});
+
+// Get messages for a specific chat
+app.get("/api/chat/:chatId/messages", verifyToken, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+    const userId = req.user.uid;
+    const userType = req.user.type;
+    
+    const chat = await Chat.findById(chatId);
+    if (!chat) {
+      return res.status(404).json({ error: "Chat not found" });
+    }
+    
+    // Verify access
+    if (userType !== "admin" && chat.userId !== userId) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+    
+    // Get messages
+    const messages = await Message.find({ chatId })
+      .sort({ createdAt: 1 })
+      .limit(200);
+    
+    // Mark messages as read if admin is viewing
+    if (userType === "admin") {
+      await Message.updateMany(
+        { chatId, isRead: false, senderType: { $ne: "admin" } },
+        { isRead: true }
+      );
+      // Reset unread count
+      chat.unreadCount = 0;
+      await chat.save();
+    }
+    
+    res.json({ messages });
+  } catch (err) {
+    console.error("Get messages error:", err);
+    res.status(500).json({ error: "Failed to get messages", details: err.message });
+  }
+});
+
+// Get user's chat (for user/staff)
+app.get("/api/chat/user", verifyToken, async (req, res) => {
+  try {
+    const userId = req.user.uid;
+    console.log(`💬 User requesting chat - UserId: ${userId}`);
+    
+    let chat = await Chat.findOne({ userId, status: "active" });
+    
+    if (!chat) {
+      console.log(`📝 Creating new chat for user: ${userId}`);
+      // Get first available admin
+      const db = mongoose.connection.useDb("healers");
+      const UserModel = db.models.User || db.model("User", userSchema);
+      const firstAdmin = await UserModel.findOne({ type: "admin" }).lean();
+      const adminId = firstAdmin ? firstAdmin.uid : null;
+      
+      // Create new chat if doesn't exist
+      chat = await Chat.create({
+        userId,
+        adminId: adminId,
+        status: "active",
+      });
+      console.log(`✅ Chat created: ${chat._id} with adminId: ${adminId}`);
+    } else {
+      console.log(`✅ Existing chat found: ${chat._id}`);
+      
+      // If chat exists but adminId is null, assign first admin
+      if (!chat.adminId) {
+        const db = mongoose.connection.useDb("healers");
+        const UserModel = db.models.User || db.model("User", userSchema);
+        const firstAdmin = await UserModel.findOne({ type: "admin" }).lean();
+        if (firstAdmin) {
+          chat.adminId = firstAdmin.uid;
+          await chat.save();
+          console.log(`✅ Assigned admin ${firstAdmin.uid} to existing chat ${chat._id}`);
+        }
+      }
+    }
+    
+    // Get messages
+    const messages = await Message.find({ chatId: chat._id })
+      .sort({ createdAt: 1 })
+      .limit(200);
+    
+    console.log(`📨 Found ${messages.length} messages for chat ${chat._id}`);
+    res.json({ chat, messages });
+  } catch (err) {
+    console.error("Get user chat error:", err);
+    res.status(500).json({ error: "Failed to get chat", details: err.message });
+  }
+});
+
+// Update request status (admin only)
+app.put("/api/chat/request/:messageId/status", verifyToken, async (req, res) => {
+  try {
+    if (req.user.type !== "admin") {
+      return res.status(403).json({ error: "Admin access required" });
+    }
+    
+    const { messageId } = req.params;
+    const { status } = req.body; // "approved", "rejected", or "added"
+    
+    if (!["approved", "rejected", "added"].includes(status)) {
+      return res.status(400).json({ error: "Invalid status. Must be 'approved', 'rejected', or 'added'" });
+    }
+    
+    const message = await Message.findById(messageId);
+    if (!message || !message.isRequest) {
+      return res.status(404).json({ error: "Request not found" });
+    }
+    
+    // Get chat to find userId
+    const chat = await Chat.findById(message.chatId);
+    if (!chat) {
+      return res.status(404).json({ error: "Chat not found" });
+    }
+    
+    // Update status
+    message.requestData.status = status;
+    await message.save();
+    
+    // If status is "added", send notification message to user and create notification
+    if (status === "added") {
+      const songName = message.requestData?.songName || "your requested song";
+      const artistName = message.requestData?.artistName || "";
+      const songInfo = artistName ? `${songName} by ${artistName}` : songName;
+      const notificationMessageText = `Your song "${songInfo}" is added please check`;
+      
+      const notificationMessage = await Message.create({
+        chatId: message.chatId,
+        senderId: req.user.uid,
+        senderType: "admin",
+        message: notificationMessageText,
+        isRequest: false,
+        isRead: false,
+      });
+      
+      // Update chat last message
+      chat.lastMessage = notificationMessageText;
+      chat.lastMessageAt = new Date();
+      chat.updatedAt = new Date();
+      await chat.save();
+      
+      // Emit notification message to user
+      const populatedNotification = await Message.findById(notificationMessage._id).lean();
+      const chatIdStr = chat._id.toString();
+      populatedNotification.chatId = chatIdStr;
+      
+      // Emit to chat room and user room
+      io.to(chatIdStr).emit("chat:message", populatedNotification);
+      io.to(chat.userId).emit("chat:message", populatedNotification);
+      
+      // Create notification for navbar notification center
+      const notification = await Notification.create({
+        userId: chat.userId,
+        type: "song_added",
+        title: "Song Added Successfully",
+        message: `Your song "${songInfo}" has been added. Please check!`,
+        metadata: {
+          chatId: chatIdStr,
+          messageId: message._id.toString(),
+          songName: songName,
+          artistName: artistName,
+        },
+      });
+      
+      // Emit real-time notification via Socket.io
+      io.to(chat.userId).emit("notification:new", notification);
+      
+      console.log(`✅ Sent notification message and notification to user ${chat.userId} about added song`);
+    }
+    
+    // Emit status update
+    io.to(message.chatId.toString()).emit("chat:request:updated", {
+      messageId: message._id,
+      status,
+    });
+    
+    // Also emit to user's room
+    io.to(chat.userId).emit("chat:request:updated", {
+      messageId: message._id,
+      status,
+    });
+    
+    res.json({ message: "Request status updated", message });
+  } catch (err) {
+    console.error("Update request status error:", err);
+    res.status(500).json({ error: "Failed to update status", details: err.message });
   }
 });
 
