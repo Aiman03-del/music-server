@@ -60,7 +60,7 @@ const client = new MongoClient(process.env.MONGO_URI, {
   useNewUrlParser: true,
   useUnifiedTopology: true,
   serverApi: ServerApiVersion.v1,
-}); 
+});
 client
   .connect()
   .then(() => console.log("✅ MongoDB connected"))
@@ -1895,7 +1895,7 @@ app.post("/api/chat/message", verifyToken, async (req, res) => {
     // If adminId is null, assign first available admin
     if (!chat.adminId) {
       const db = mongoose.connection.useDb("healers");
-      const UserModel = db.models.User || db.model("User", userSchema);
+    const UserModel = db.models.User || db.model("User", userSchema);
       const firstAdmin = await UserModel.findOne({ type: "admin" }).lean();
       if (firstAdmin) {
         chat.adminId = firstAdmin.uid;
@@ -1918,7 +1918,7 @@ app.post("/api/chat/message", verifyToken, async (req, res) => {
         });
       }
     }
-    
+
     // Create message
     const newMessage = await Message.create({
       chatId,
@@ -2026,7 +2026,7 @@ app.get("/api/chat/admin/conversations", verifyToken, async (req, res) => {
         };
       })
     );
-    
+
     console.log(`📋 Returning ${conversations.length} conversations`);
     res.json({ conversations });
   } catch (err) {
@@ -2051,7 +2051,7 @@ app.get("/api/chat/:chatId/messages", verifyToken, async (req, res) => {
     if (userType !== "admin" && chat.userId !== userId) {
       return res.status(403).json({ error: "Not authorized" });
     }
-    
+
     // Get messages
     const messages = await Message.find({ chatId })
       .sort({ createdAt: 1 })
@@ -2061,13 +2061,13 @@ app.get("/api/chat/:chatId/messages", verifyToken, async (req, res) => {
     if (userType === "admin") {
       await Message.updateMany(
         { chatId, isRead: false, senderType: { $ne: "admin" } },
-        { isRead: true }
-      );
+      { isRead: true }
+    );
       // Reset unread count
       chat.unreadCount = 0;
       await chat.save();
     }
-    
+
     res.json({ messages });
   } catch (err) {
     console.error("Get messages error:", err);
@@ -2087,7 +2087,7 @@ app.get("/api/chat/user", verifyToken, async (req, res) => {
       console.log(`📝 Creating new chat for user: ${userId}`);
       // Get first available admin
       const db = mongoose.connection.useDb("healers");
-      const UserModel = db.models.User || db.model("User", userSchema);
+    const UserModel = db.models.User || db.model("User", userSchema);
       const firstAdmin = await UserModel.findOne({ type: "admin" }).lean();
       const adminId = firstAdmin ? firstAdmin.uid : null;
       
@@ -2113,7 +2113,7 @@ app.get("/api/chat/user", verifyToken, async (req, res) => {
         }
       }
     }
-    
+
     // Get messages
     const messages = await Message.find({ chatId: chat._id })
       .sort({ createdAt: 1 })
