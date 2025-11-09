@@ -8,6 +8,8 @@ const morgan = require("morgan");
 const http = require("http");
 const { Server } = require("socket.io");
 const mongoose = require("mongoose");
+const compression = require("compression");
+const helmet = require("helmet");
 const app = express();
 const PORT = process.env.PORT || 5000;
 const multer = require("multer");
@@ -51,6 +53,12 @@ app.use(
     credentials: true, // ✅ VERY IMPORTANT
   })
 );
+app.use(
+  helmet({
+    crossOriginResourcePolicy: false,
+  })
+);
+app.use(compression());
 app.use(express.json());
 app.use(cookieParser());
 app.use(morgan("dev"));
@@ -336,7 +344,7 @@ app.post("/api/songs", verifyToken, async (req, res) => {
 // API route to get all songs (public) - sorted by playCount descending
 app.get("/api/songs", async (req, res) => {
   try {
-    const { q } = req.query;
+    const { q, limit, fields } = req.query;
     let filter = {};
     if (q && q.trim()) {
       const regex = new RegExp(q.trim(), "i");
@@ -348,7 +356,27 @@ app.get("/api/songs", async (req, res) => {
         ],
       };
     }
-    const songs = await Song.find(filter).sort({ playCount: -1, _id: -1 });
+
+    let query = Song.find(filter).sort({ playCount: -1, _id: -1 });
+
+    const limitValue = parseInt(limit, 10);
+    if (!Number.isNaN(limitValue) && limitValue > 0) {
+      query = query.limit(limitValue);
+    }
+
+    if (fields) {
+      const projection = fields
+        .split(",")
+        .map((f) => f.trim())
+        .filter(Boolean)
+        .join(" ");
+      if (projection) {
+        query = query.select(projection);
+      }
+    }
+
+    const songs = await query.lean();
+    res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
     res.json({ songs });
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch songs" });
@@ -363,7 +391,8 @@ app.get("/api/songs/trending", async (req, res) => {
     // Get songs with highest playCount, minimum 1 play
     const songs = await Song.find({ playCount: { $gte: 1 } })
       .sort({ playCount: -1, _id: -1 })
-      .limit(limit);
+      .limit(limit)
+      .lean();
     
     // If not enough songs with plays, fill with recent songs
     if (songs.length < limit) {
@@ -372,10 +401,12 @@ app.get("/api/songs/trending", async (req, res) => {
         _id: { $nin: songs.map(s => s._id) } 
       })
         .sort({ createdAt: -1 })
-        .limit(remaining);
+        .limit(remaining)
+        .lean();
       songs.push(...recentSongs);
     }
     
+    res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
     res.json({ songs });
   } catch (err) {
     console.error("Error fetching trending songs:", err);
@@ -390,7 +421,9 @@ app.get("/api/songs/new-releases", async (req, res) => {
     const limit = parseInt(req.query.limit) || 6;
     const songs = await Song.find()
       .sort({ createdAt: -1, _id: -1 })
-      .limit(limit);
+      .limit(limit)
+      .lean();
+    res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=120");
     res.json({ songs });
   } catch (err) {
     console.error("Error fetching new releases:", err);
@@ -1729,7 +1762,7 @@ app.get("/api/playlists/shared/:userId", async (req, res) => {
     const { userId } = req.params;
     const sharedPlaylists = await Playlist.find({ 
       sharedWith: userId 
-    });
+    }).lean();
     res.json(sharedPlaylists);
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch shared playlists" });
@@ -1742,7 +1775,9 @@ app.get("/api/playlists/public/all", async (req, res) => {
     const limit = parseInt(req.query.limit) || 20;
     const publicPlaylists = await Playlist.find({ isPublic: true })
       .sort({ playCount: -1, createdAt: -1 })
-      .limit(limit);
+      .limit(limit)
+      .lean();
+    res.set("Cache-Control", "public, max-age=120, stale-while-revalidate=300");
     res.json(publicPlaylists);
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch public playlists" });
@@ -1759,20 +1794,21 @@ app.get("/api/playlists/public/trending", async (req, res) => {
       $expr: { $gt: [{ $size: "$songs" }, 0] } // At least 1 song
     })
       .sort({ playCount: -1, createdAt: -1 })
-      .limit(limit);
+      .limit(limit)
+      .lean();
     
     // Populate first song for each playlist (for cover image)
     const playlistsWithCovers = await Promise.all(
       playlists.map(async (pl) => {
-        const playlistObj = pl.toObject();
+        const playlistObj = { ...pl };
         if (playlistObj.songs && playlistObj.songs.length > 0) {
-          const firstSong = await Song.findById(playlistObj.songs[0]);
+          const firstSong = await Song.findById(playlistObj.songs[0]).lean();
           playlistObj.firstSongCover = firstSong?.cover || null;
         }
         return playlistObj;
       })
     );
-    
+    res.set("Cache-Control", "public, max-age=60, stale-while-revalidate=180");
     res.json({ playlists: playlistsWithCovers });
   } catch (err) {
     console.error("Failed to fetch trending playlists:", err);
