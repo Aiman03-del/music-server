@@ -150,6 +150,13 @@ const requireStaffOrAdmin = (req, res, next) => {
   next();
 };
 
+const requireAdmin = (req, res, next) => {
+  if (req.user?.type !== "admin") {
+    return res.status(403).json({ error: "Admin access required" });
+  }
+  next();
+};
+
 // Socket.IO setup
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -1201,6 +1208,13 @@ const reviewSchema = new mongoose.Schema({
   userEmail: { type: String, default: "" },
   rating: { type: Number, min: 1, max: 5, required: true },
   comment: { type: String, default: "" },
+  status: {
+    type: String,
+    enum: ["pending", "approved", "rejected"],
+    default: "pending",
+  },
+  reviewedAt: { type: Date, default: null },
+  reviewedBy: { type: String, default: "" },
   createdAt: { type: Date, default: Date.now },
 });
 const Review = db.models.Review || db.model("Review", reviewSchema);
@@ -1891,13 +1905,15 @@ app.post("/api/reviews", verifyToken, async (req, res) => {
 
     let userName = req.user.name || "";
     let userEmail = req.user.email || "";
+    let userImage = req.user.image || "";
 
     if (!userName || !userEmail) {
       const dbUser = await UserModel.findOne({ uid: req.user.uid })
-        .select("name email")
+        .select("name email image")
         .lean();
       userName = dbUser?.name || userName;
       userEmail = dbUser?.email || userEmail;
+      userImage = dbUser?.image || userImage;
     }
 
     const review = await Review.create({
@@ -1906,6 +1922,7 @@ app.post("/api/reviews", verifyToken, async (req, res) => {
       userEmail,
       rating,
       comment,
+      status: "pending",
     });
 
     await notifyAdmins({
@@ -1918,6 +1935,8 @@ app.post("/api/reviews", verifyToken, async (req, res) => {
         comment,
         userId: req.user.uid,
         userEmail: req.user.email,
+        userName,
+        userImage,
       },
     });
 
@@ -1925,6 +1944,71 @@ app.post("/api/reviews", verifyToken, async (req, res) => {
   } catch (err) {
     console.error("Failed to submit review:", err);
     res.status(500).json({ error: "Failed to submit review" });
+  }
+});
+
+app.get("/api/reviews", async (req, res) => {
+  try {
+    const limitParam = parseInt(req.query.limit, 10);
+    const limit = !Number.isNaN(limitParam)
+      ? Math.min(Math.max(limitParam, 1), 30)
+      : 6;
+
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+
+    const reviews = await Review.find({ status: "approved" })
+      .sort({ createdAt: -1, _id: -1 })
+      .limit(limit)
+      .lean();
+
+    const userIds = [
+      ...new Set(
+        reviews
+          .map((review) => review.userId)
+          .filter((value) => typeof value === "string" && value.trim())
+      ),
+    ];
+
+    let usersById = new Map();
+    if (userIds.length > 0) {
+      const users = await UserModel.find({ uid: { $in: userIds } })
+        .select("uid name email image type")
+        .lean();
+      usersById = new Map(users.map((user) => [user.uid, user]));
+    }
+
+    const response = reviews.map((review) => {
+      const userInfo = usersById.get(review.userId) || null;
+      const fallbackName =
+        userInfo?.name ||
+        review.userName ||
+        userInfo?.email ||
+        review.userEmail ||
+        "Anonymous listener";
+      const fallbackEmail = userInfo?.email || review.userEmail || "";
+
+      return {
+        _id: review._id,
+        rating: review.rating,
+        comment: review.comment,
+        createdAt: review.createdAt,
+        user: {
+          uid: userInfo?.uid || review.userId || null,
+          name: fallbackName,
+          email: fallbackEmail,
+          image: userInfo?.image || "",
+          type: userInfo?.type || "user",
+        },
+      };
+    });
+
+    res.json({ reviews: response });
+  } catch (err) {
+    console.error("Failed to fetch reviews:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to fetch reviews", details: err.message });
   }
 });
 
@@ -1939,6 +2023,58 @@ app.get(
     } catch (err) {
       console.error("Failed to fetch reviews:", err);
       res.status(500).json({ error: "Failed to fetch reviews" });
+    }
+  }
+);
+
+app.put(
+  "/api/reviews/:id/status",
+  verifyToken,
+  requireAdmin,
+  async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { status } = req.body;
+
+      if (!mongoose.Types.ObjectId.isValid(id)) {
+        return res.status(400).json({ error: "Invalid review id" });
+      }
+
+      if (!["approved", "rejected"].includes(status)) {
+        return res.status(400).json({ error: "Invalid status" });
+      }
+
+      const review = await Review.findByIdAndUpdate(
+        id,
+        {
+          status,
+          reviewedAt: new Date(),
+          reviewedBy: req.user?.uid || "",
+        },
+        { new: true }
+      ).lean();
+
+      if (!review) {
+        return res.status(404).json({ error: "Review not found" });
+      }
+
+      await Notification.updateMany(
+        { "metadata.reviewId": id },
+        { $set: { isRead: true } }
+      );
+
+      io.to("admin:all").emit("review:status", {
+        reviewId: id,
+        status,
+      });
+
+      res.json({ message: `Review ${status}`, review });
+    } catch (err) {
+      console.error("Failed to update review status:", err);
+      res.status(500).json({
+        error: "Failed to update review status",
+        details: err.message,
+      });
     }
   }
 );
