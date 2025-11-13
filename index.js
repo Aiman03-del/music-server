@@ -87,6 +87,22 @@ mongoose.connect(process.env.MONGO_URI + "/healers"); // force DB
 // JWT secret
 const jwtSecret = process.env.JWT_SECRET || "your_jwt_secret_here";
 
+const slugify = (str = "") =>
+  str
+    .toString()
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+
+const unslugify = (slug = "") =>
+  slug
+    .toString()
+    .replace(/-/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+
 // ✅ Define verifyToken middleware before all routes
 const verifyToken = async (req, res, next) => {
   const token = req.cookies?.token;
@@ -380,6 +396,44 @@ app.get("/api/songs", async (req, res) => {
     res.json({ songs });
   } catch (err) {
     res.status(500).json({ error: "Failed to fetch songs" });
+  }
+});
+
+const escapeRegex = (str = "") =>
+  str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+app.get("/api/artists/:slug/songs", async (req, res) => {
+  try {
+    const { slug } = req.params;
+    if (!slug) {
+      return res.status(400).json({ error: "Artist slug is required" });
+    }
+
+    const candidate = unslugify(slug);
+    if (!candidate) {
+      return res.json({ artist: "", artistSlug: slug, songs: [] });
+    }
+
+    const regex = new RegExp(`^${escapeRegex(candidate)}$`, "i");
+    const songs = await Song.find({ artist: regex }).sort({ createdAt: -1, _id: -1 });
+
+    if (!songs.length) {
+      return res.json({
+        artist: candidate,
+        artistSlug: slug,
+        songs: [],
+      });
+    }
+
+    const artistName = songs[0].artist || candidate;
+    return res.json({
+      artist: artistName,
+      artistSlug: slugify(artistName),
+      songs,
+    });
+  } catch (err) {
+    console.error("Error fetching artist songs:", err);
+    res.status(500).json({ error: "Failed to fetch artist songs" });
   }
 });
 
@@ -2018,6 +2072,106 @@ app.post("/api/chat/message", verifyToken, async (req, res) => {
   } catch (err) {
     console.error("Send message error:", err);
     res.status(500).json({ error: "Failed to send message", details: err.message });
+  }
+});
+
+// Delete single chat message
+app.delete("/api/chat/message/:messageId", verifyToken, async (req, res) => {
+  try {
+    const { messageId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(messageId)) {
+      return res.status(400).json({ error: "Invalid messageId" });
+    }
+
+    const message = await Message.findById(messageId);
+    if (!message) {
+      return res.status(404).json({ error: "Message not found" });
+    }
+
+    const chat = await Chat.findById(message.chatId);
+    if (!chat) {
+      return res.status(404).json({ error: "Chat not found" });
+    }
+
+    const isAdmin = req.user.type === "admin";
+    if (!isAdmin && message.senderId !== req.user.uid) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+
+    await Message.findByIdAndDelete(messageId);
+
+    const latestMessage = await Message.find({ chatId: chat._id })
+      .sort({ createdAt: -1 })
+      .limit(1)
+      .lean();
+
+    if (latestMessage.length > 0) {
+      const [recent] = latestMessage;
+      chat.lastMessage =
+        recent.isRequest && recent.requestData
+          ? `Music Request: ${recent.requestData.songName || "New request"}`
+          : recent.message || "";
+      chat.lastMessageAt = recent.createdAt;
+    } else {
+      chat.lastMessage = "";
+      chat.lastMessageAt = null;
+      chat.unreadCount = 0;
+    }
+
+    chat.updatedAt = new Date();
+    await chat.save();
+
+    const chatIdStr = chat._id.toString();
+    const deletedPayload = {
+      messageId: messageId.toString(),
+      chatId: chatIdStr,
+    };
+
+    io.to(chatIdStr).emit("chat:message:deleted", deletedPayload);
+    io.to(chat.userId).emit("chat:message:deleted", deletedPayload);
+    io.to("admin:all").emit("chat:message:deleted", deletedPayload);
+
+    res.json({ message: "Message deleted", chat });
+  } catch (err) {
+    console.error("Delete chat message error:", err);
+    res.status(500).json({ error: "Failed to delete message", details: err.message });
+  }
+});
+
+// Delete chat along with its messages
+app.delete("/api/chat/:chatId", verifyToken, async (req, res) => {
+  try {
+    const { chatId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(chatId)) {
+      return res.status(400).json({ error: "Invalid chatId" });
+    }
+
+    const chat = await Chat.findById(chatId);
+    if (!chat) {
+      return res.status(404).json({ error: "Chat not found" });
+    }
+
+    const userType = req.user.type || "user";
+    if (userType !== "admin" && chat.userId !== req.user.uid) {
+      return res.status(403).json({ error: "Not authorized" });
+    }
+
+    const chatIdStr = chat._id.toString();
+
+    await Message.deleteMany({ chatId: chat._id });
+    await Notification.deleteMany({ "metadata.chatId": chatIdStr });
+    await chat.deleteOne();
+
+    io.to(chatIdStr).emit("chat:deleted", { chatId: chatIdStr });
+    io.to(chat.userId).emit("chat:deleted", { chatId: chatIdStr });
+    io.to("admin:all").emit("chat:deleted", { chatId: chatIdStr });
+
+    res.json({ message: "Chat deleted successfully" });
+  } catch (err) {
+    console.error("Delete chat error:", err);
+    res.status(500).json({ error: "Failed to delete chat", details: err.message });
   }
 });
 
