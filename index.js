@@ -142,6 +142,14 @@ const verifyToken = async (req, res, next) => {
   });
 };
 
+const requireStaffOrAdmin = (req, res, next) => {
+  const role = req.user?.type;
+  if (!role || !["admin", "staff"].includes(role)) {
+    return res.status(403).json({ error: "Staff or admin access required" });
+  }
+  next();
+};
+
 // Socket.IO setup
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -305,6 +313,7 @@ app.get("/api/users/:uid", verifyToken, async (req, res) => {
 const songSchema = new mongoose.Schema({
   title: String,
   artist: String,
+  artists: { type: [String], default: [] },
   genre: [String],
   cover: String,
   audio: String,
@@ -315,26 +324,199 @@ const Song =
   mongoose.connection.useDb("healers").models.Song ||
   mongoose.connection.useDb("healers").model("Song", songSchema);
 
+const artistProfileSchema = new mongoose.Schema({
+  artist: { type: String, required: true },
+  artistSlug: { type: String, required: true, unique: true },
+  displayName: { type: String, default: "" },
+  bio: { type: String, default: "" },
+  image: { type: String, default: "" },
+  coverImage: { type: String, default: "" },
+  genres: { type: [String], default: [] },
+  tags: { type: [String], default: [] },
+  socials: {
+    facebook: { type: String, default: "" },
+    instagram: { type: String, default: "" },
+    twitter: { type: String, default: "" },
+    youtube: { type: String, default: "" },
+    website: { type: String, default: "" },
+    tiktok: { type: String, default: "" },
+  },
+  featuredSongIds: [{ type: mongoose.Schema.Types.ObjectId, ref: "Song" }],
+  createdAt: { type: Date, default: Date.now },
+  updatedAt: { type: Date, default: Date.now },
+  updatedBy: { type: String, default: "" },
+});
+
+artistProfileSchema.pre("save", function (next) {
+  this.updatedAt = new Date();
+  next();
+});
+
+const ArtistProfile =
+  mongoose.connection.useDb("healers").models.ArtistProfile ||
+  mongoose.connection.useDb("healers").model("ArtistProfile", artistProfileSchema);
+
+const serializeArtistProfile = (doc) => {
+  if (!doc) return null;
+  const plain = typeof doc.toObject === "function" ? doc.toObject() : doc;
+  return {
+    artist: plain.artist,
+    artistSlug: plain.artistSlug,
+    displayName: plain.displayName || "",
+    bio: plain.bio || "",
+    image: plain.image || "",
+    coverImage: plain.coverImage || "",
+    genres: Array.isArray(plain.genres) ? plain.genres : [],
+    tags: Array.isArray(plain.tags) ? plain.tags : [],
+    socials: {
+      facebook: plain.socials?.facebook || "",
+      instagram: plain.socials?.instagram || "",
+      twitter: plain.socials?.twitter || "",
+      youtube: plain.socials?.youtube || "",
+      website: plain.socials?.website || "",
+      tiktok: plain.socials?.tiktok || "",
+    },
+    featuredSongIds: Array.isArray(plain.featuredSongIds)
+      ? plain.featuredSongIds.map((id) => id.toString())
+      : [],
+    createdAt: plain.createdAt,
+    updatedAt: plain.updatedAt,
+    updatedBy: plain.updatedBy || "",
+  };
+};
+
+const normalizeArtistName = (name = "") =>
+  name
+    .toString()
+    .replace(/\s+/g, " ")
+    .trim();
+
+const splitArtistString = (value = "") =>
+  value
+    .replace(/\s+(feat\.?|ft\.?|featuring)\s+/gi, ",")
+    .replace(/\s+vs\.?\s+/gi, ",")
+    .replace(/\s+x\s+/gi, ",")
+    .replace(/\s+and\s+/gi, ",")
+    .replace(/&/g, ",")
+    .split(",")
+    .map(normalizeArtistName)
+    .filter(Boolean);
+
+const dedupeArtistList = (artists = []) =>
+  Array.from(
+    new Map(
+      artists
+        .map((name) => normalizeArtistName(name))
+        .filter(Boolean)
+        .map((name) => [name.toLowerCase(), name])
+    ).values()
+  );
+
+const resolveArtistsArray = (artistsInput, artistString) => {
+  let baseList = [];
+
+  if (Array.isArray(artistsInput) && artistsInput.length) {
+    baseList = artistsInput.reduce((acc, value) => {
+      if (typeof value === "string") {
+        acc.push(...splitArtistString(value));
+      }
+      return acc;
+    }, []);
+  }
+
+  if (!baseList.length && typeof artistString === "string") {
+    baseList = splitArtistString(artistString);
+  }
+
+  return dedupeArtistList(baseList);
+};
+
+const extractSongArtists = (song) => {
+  if (!song) return [];
+  if (Array.isArray(song.artists) && song.artists.length) {
+    return dedupeArtistList(song.artists);
+  }
+  if (typeof song.artist === "string") {
+    return splitArtistString(song.artist);
+  }
+  return [];
+};
+
+const pickSongSummary = (song) => ({
+  _id: song._id,
+  title: song.title,
+  artist: song.artist,
+  artists: Array.isArray(song.artists) ? song.artists : [],
+  genre: song.genre,
+  cover: song.cover,
+  audio: song.audio,
+  playCount: song.playCount,
+  createdAt: song.createdAt,
+});
+
+const aggregateSongsByArtist = (songs = []) => {
+  const map = new Map();
+
+  songs.forEach((song) => {
+    const artistNames = extractSongArtists(song);
+    if (!artistNames.length) return;
+
+    const summary = pickSongSummary(song);
+
+    artistNames.forEach((name) => {
+      const slug = slugify(name);
+      if (!slug) return;
+
+      if (!map.has(slug)) {
+        map.set(slug, {
+          artist: name,
+          artistSlug: slug,
+          songCount: 0,
+          songs: [],
+          cover: "",
+        });
+      }
+
+      const entry = map.get(slug);
+      entry.songCount += 1;
+      entry.songs.push(summary);
+      if (!entry.cover && song.cover) {
+        entry.cover = song.cover;
+      }
+    });
+  });
+
+  return map;
+};
+
 // API route to add a song (protected)
 app.post("/api/songs", verifyToken, async (req, res) => {
   try {
-    const { title, artist, genre, cover, audio } = req.body; // remove duration
+    const { title, artist, artists, genre, cover, audio } = req.body; // remove duration
 
     // Improved validation
     const errors = [];
     if (!title?.trim()) errors.push("Title is required");
-    if (!artist?.trim()) errors.push("Artist is required");
     if (!genre || !Array.isArray(genre)) errors.push("Genre must be an array");
     if (!cover?.trim()) errors.push("Cover URL is required");
     if (!audio?.trim()) errors.push("Audio URL is required");
+
+    const artistList = resolveArtistsArray(artists, artist);
+    if (!artistList.length) errors.push("At least one artist is required");
 
     if (errors.length > 0) {
       return res.status(400).json({ error: errors.join(", ") });
     }
 
+    const artistDisplay =
+      typeof artist === "string" && artist.trim()
+        ? artist.trim()
+        : artistList.join(", ");
+
     const song = new Song({
       title: title.trim(),
-      artist: artist.trim(),
+      artist: artistDisplay,
+      artists: artistList,
       genre: Array.isArray(genre) ? genre : [genre],
       cover,
       audio,
@@ -399,6 +581,327 @@ app.get("/api/songs", async (req, res) => {
   }
 });
 
+// Get all artists with optional songs list
+app.get("/api/artists", async (req, res) => {
+  try {
+    const limit = parseInt(req.query.limit, 10);
+    const includeSongs = req.query.includeSongs !== "false";
+
+    const songs = await Song.find()
+      .sort({ createdAt: -1, _id: -1 })
+      .lean();
+
+    const aggregated = Array.from(aggregateSongsByArtist(songs).values());
+
+    const searchTerm = (
+      req.query.search ||
+      req.query.q ||
+      ""
+    )
+      .toString()
+      .trim()
+      .toLowerCase();
+
+    let artists = aggregated;
+
+    if (searchTerm) {
+      artists = artists.filter(
+        (entry) =>
+          entry.artist.toLowerCase().includes(searchTerm) ||
+          entry.artistSlug.toLowerCase().includes(searchTerm)
+      );
+    }
+
+    artists.sort((a, b) => a.artist.localeCompare(b.artist));
+
+    if (!Number.isNaN(limit) && limit > 0) {
+      artists = artists.slice(0, limit);
+    }
+
+    const response = artists.map((entry) => ({
+      artist: entry.artist,
+      artistSlug: entry.artistSlug,
+      songCount: entry.songCount,
+      songs:
+        includeSongs && entry.songs
+          ? entry.songs.map((song) => ({
+              _id: song._id,
+              title: song.title,
+              artist: song.artist,
+              artists: song.artists,
+              genre: song.genre,
+              cover: song.cover,
+              audio: song.audio,
+              playCount: song.playCount,
+              createdAt: song.createdAt,
+            }))
+          : undefined,
+    }));
+
+    res.set("Cache-Control", "public, max-age=120, stale-while-revalidate=300");
+    res.json({
+      artists: response,
+      count: response.length,
+      includeSongs,
+    });
+  } catch (err) {
+    console.error("Error fetching artists:", err);
+    res
+      .status(500)
+      .json({ error: "Failed to fetch artists", details: err.message });
+  }
+});
+
+app.get(
+  "/api/artist-profiles",
+  verifyToken,
+  requireStaffOrAdmin,
+  async (req, res) => {
+    try {
+      const search = (req.query.search || "").trim().toLowerCase();
+      const limit = parseInt(req.query.limit, 10);
+
+      const songs = await Song.find()
+        .sort({ createdAt: -1, _id: -1 })
+        .lean();
+
+      const artistMap = aggregateSongsByArtist(songs);
+
+      const profiles = await ArtistProfile.find().lean();
+      const profileMap = new Map(
+        profiles
+          .map((profile) => ({
+            slug: profile.artistSlug || slugify(profile.artist || ""),
+            profile,
+          }))
+          .filter((entry) => entry.slug)
+          .map((entry) => [entry.slug, entry.profile])
+      );
+
+      profiles.forEach((profile) => {
+        const slug = profile.artistSlug || slugify(profile.artist || "");
+        if (!slug) return;
+
+        if (!artistMap.has(slug)) {
+          artistMap.set(slug, {
+            artist: profile.artist || unslugify(slug),
+            artistSlug: slug,
+            songCount: 0,
+            songs: [],
+            cover: profile.image || profile.coverImage || "",
+          });
+        } else {
+          const entry = artistMap.get(slug);
+          if (!entry.artist && profile.artist) {
+            entry.artist = profile.artist;
+          }
+          if (!entry.cover && (profile.image || profile.coverImage)) {
+            entry.cover = profile.image || profile.coverImage || "";
+          }
+        }
+      });
+
+      let artists = Array.from(artistMap.values());
+
+      if (search) {
+        artists = artists.filter(
+          (entry) =>
+            entry.artist.toLowerCase().includes(search) ||
+            entry.artistSlug.toLowerCase().includes(search)
+        );
+      }
+
+      artists.sort((a, b) => a.artist.localeCompare(b.artist));
+
+      if (!Number.isNaN(limit) && limit > 0) {
+        artists = artists.slice(0, limit);
+      }
+
+      const response = artists.map((entry) => ({
+        artist: entry.artist,
+        artistSlug: entry.artistSlug,
+        songCount: entry.songCount,
+        cover: entry.cover || entry.songs[0]?.cover || "",
+        profile: serializeArtistProfile(profileMap.get(entry.artistSlug)),
+      }));
+
+      res.json({ artists: response, count: response.length });
+    } catch (err) {
+      console.error("Failed to fetch artist profiles:", err);
+      res.status(500).json({
+        error: "Failed to fetch artist profiles",
+        details: err.message,
+      });
+    }
+  }
+);
+
+app.get(
+  "/api/artist-profiles/:slug",
+  verifyToken,
+  requireStaffOrAdmin,
+  async (req, res) => {
+    try {
+      const { slug } = req.params;
+      if (!slug) {
+        return res.status(400).json({ error: "Artist slug is required" });
+      }
+
+      const normalizedSlug = slugify(slug);
+      const [profileDoc, songs] = await Promise.all([
+        ArtistProfile.findOne({
+          artistSlug: normalizedSlug,
+        }).lean(),
+        Song.find()
+          .sort({ createdAt: -1, _id: -1 })
+          .lean(),
+      ]);
+
+      const aggregated = aggregateSongsByArtist(songs);
+      const entry = aggregated.get(normalizedSlug);
+
+      const responseSongs = entry?.songs
+        ? entry.songs.map((song) => ({
+            _id: song._id,
+            title: song.title,
+            artist: song.artist,
+            artists: song.artists,
+            cover: song.cover,
+            genre: song.genre,
+            playCount: song.playCount,
+            createdAt: song.createdAt,
+          }))
+        : [];
+
+      const resolvedArtistName =
+        profileDoc?.artist ||
+        entry?.artist ||
+        unslugify(normalizedSlug).trim();
+
+      res.json({
+        artist: resolvedArtistName,
+        artistSlug: normalizedSlug,
+        songCount: responseSongs.length,
+        songs: responseSongs,
+        profile: serializeArtistProfile(profileDoc),
+      });
+    } catch (err) {
+      console.error("Failed to fetch artist profile:", err);
+      res.status(500).json({
+        error: "Failed to fetch artist profile",
+        details: err.message,
+      });
+    }
+  }
+);
+
+app.put(
+  "/api/artist-profiles/:slug",
+  verifyToken,
+  requireStaffOrAdmin,
+  async (req, res) => {
+    try {
+      const { slug } = req.params;
+      const normalizedSlug = slugify(slug || req.body.artist || "");
+
+      if (!normalizedSlug) {
+        return res.status(400).json({ error: "Invalid artist slug" });
+      }
+
+      const artistName = (req.body.artist || unslugify(normalizedSlug)).trim();
+      if (!artistName) {
+        return res
+          .status(400)
+          .json({ error: "Artist name is required for profile updates" });
+      }
+
+      const {
+        displayName,
+        bio,
+        image,
+        coverImage,
+        genres,
+        tags,
+        socials = {},
+        featuredSongIds = [],
+      } = req.body;
+
+      const toArray = (value) => {
+        if (Array.isArray(value)) return value;
+        if (typeof value === "string") {
+          return value
+            .split(",")
+            .map((item) => item.trim())
+            .filter(Boolean);
+        }
+        return [];
+      };
+
+      const parsedGenres = Array.from(new Set(toArray(genres)));
+      const parsedTags = Array.from(new Set(toArray(tags)));
+
+      const sanitizeSocials = (input = {}) => ({
+        facebook: input.facebook?.trim() || "",
+        instagram: input.instagram?.trim() || "",
+        twitter: input.twitter?.trim() || "",
+        youtube: input.youtube?.trim() || "",
+        website: input.website?.trim() || "",
+        tiktok: input.tiktok?.trim() || "",
+      });
+
+      const validatedFeaturedIds = Array.isArray(featuredSongIds)
+        ? featuredSongIds
+            .map((id) =>
+              mongoose.Types.ObjectId.isValid(id)
+                ? new mongoose.Types.ObjectId(id)
+                : null
+            )
+            .filter(Boolean)
+        : [];
+
+      const updatePayload = {
+        artist: artistName,
+        artistSlug: normalizedSlug,
+        displayName: displayName?.trim() || artistName,
+        bio: bio || "",
+        image: image || "",
+        coverImage: coverImage || "",
+        genres: parsedGenres,
+        tags: parsedTags,
+        socials: sanitizeSocials(socials),
+        featuredSongIds: validatedFeaturedIds,
+        updatedAt: new Date(),
+        updatedBy: req.user?.uid || "",
+      };
+
+      const updatedProfile = await ArtistProfile.findOneAndUpdate(
+        { artistSlug: normalizedSlug },
+        {
+          $set: updatePayload,
+          $setOnInsert: { createdAt: new Date() },
+        },
+        { new: true, upsert: true }
+      );
+
+      if (req.user?.uid) {
+        await logActivity({
+          uid: req.user.uid,
+          action: "Updated artist profile",
+          meta: { artistSlug: normalizedSlug, artist: artistName },
+        });
+      }
+
+      res.json({ profile: serializeArtistProfile(updatedProfile) });
+    } catch (err) {
+      console.error("Failed to update artist profile:", err);
+      res.status(500).json({
+        error: "Failed to update artist profile",
+        details: err.message,
+      });
+    }
+  }
+);
+
 const escapeRegex = (str = "") =>
   str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
@@ -414,22 +917,39 @@ app.get("/api/artists/:slug/songs", async (req, res) => {
       return res.json({ artist: "", artistSlug: slug, songs: [] });
     }
 
-    const regex = new RegExp(`^${escapeRegex(candidate)}$`, "i");
-    const songs = await Song.find({ artist: regex }).sort({ createdAt: -1, _id: -1 });
+    const normalizedSlug = slugify(candidate);
+    const songs = await Song.find()
+      .sort({ createdAt: -1, _id: -1 })
+      .lean();
 
-    if (!songs.length) {
+    const aggregated = aggregateSongsByArtist(songs);
+    const entry = aggregated.get(normalizedSlug);
+
+    if (!entry) {
       return res.json({
         artist: candidate,
-        artistSlug: slug,
+        artistSlug: normalizedSlug,
         songs: [],
       });
     }
 
-    const artistName = songs[0].artist || candidate;
+    const responseSongs = entry.songs.map((song) => ({
+      _id: song._id,
+      title: song.title,
+      artist: song.artist,
+      artists: song.artists,
+      genre: song.genre,
+      cover: song.cover,
+      audio: song.audio,
+      playCount: song.playCount,
+      createdAt: song.createdAt,
+    }));
+
+    const artistName = entry.artist || candidate;
     return res.json({
       artist: artistName,
-      artistSlug: slugify(artistName),
-      songs,
+      artistSlug: entry.artistSlug,
+      songs: responseSongs,
     });
   } catch (err) {
     console.error("Error fetching artist songs:", err);
@@ -514,14 +1034,43 @@ app.get("/api/songs/:id", async (req, res) => {
 app.put("/api/songs/:id", verifyToken, async (req, res) => {
   try {
     // Remove duration from update
-    const { title, artist, genre, cover, audio } = req.body;
-    const updateData = {
-      title,
-      artist,
-      genre,
-      cover,
-      audio,
-    };
+    const { title, artist, artists, genre, cover, audio } = req.body;
+    const updateData = {};
+
+    if (typeof title === "string") {
+      updateData.title = title.trim();
+    }
+
+    if (cover !== undefined) {
+      updateData.cover = cover;
+    }
+
+    if (audio !== undefined) {
+      updateData.audio = audio;
+    }
+
+    if (genre !== undefined) {
+      if (Array.isArray(genre)) {
+        updateData.genre = genre;
+      } else if (typeof genre === "string" && genre.trim()) {
+        updateData.genre = [genre.trim()];
+      }
+    }
+
+    if (artist !== undefined || (Array.isArray(artists) && artists.length)) {
+      const artistList = resolveArtistsArray(artists, artist);
+      if (artistList.length) {
+        updateData.artists = artistList;
+        updateData.artist =
+          typeof artist === "string" && artist.trim()
+            ? artist.trim()
+            : artistList.join(", ");
+      } else if (typeof artist === "string") {
+        updateData.artist = artist.trim();
+        updateData.artists = [];
+      }
+    }
+
     const updated = await Song.findByIdAndUpdate(req.params.id, updateData, {
       new: true,
     });
@@ -645,6 +1194,16 @@ const notificationSchema = new mongoose.Schema({
   createdAt: { type: Date, default: Date.now },
 });
 const Notification = db.models.Notification || db.model("Notification", notificationSchema);
+
+const reviewSchema = new mongoose.Schema({
+  userId: { type: String, required: true },
+  userName: { type: String, default: "" },
+  userEmail: { type: String, default: "" },
+  rating: { type: Number, min: 1, max: 5, required: true },
+  comment: { type: String, default: "" },
+  createdAt: { type: Date, default: Date.now },
+});
+const Review = db.models.Review || db.model("Review", reviewSchema);
 
 // Chat Schema - Represents a conversation between a user/staff and admin
 const chatSchema = new mongoose.Schema({
@@ -972,6 +1531,39 @@ async function logActivity({ uid, action, meta }) {
   await Activity.create({ uid, action, meta });
 }
 
+async function notifyAdmins({ type = "notification", title, message, metadata = {} }) {
+  try {
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+    const admins = await UserModel.find({ type: "admin" }).lean();
+
+    if (!admins.length) {
+      return;
+    }
+
+    const notifications = [];
+
+    for (const admin of admins) {
+      const notification = await Notification.create({
+        userId: admin.uid,
+        type,
+        title: title || "Notification",
+        message: message || "",
+        metadata,
+      });
+
+      notifications.push(notification);
+      io.to(admin.uid).emit("notification:new", notification);
+    }
+
+    notifications.forEach((notification) => {
+      io.to("admin:all").emit("notification:new", notification);
+    });
+  } catch (err) {
+    console.error("Failed to notify admins:", err);
+  }
+}
+
 // Activity API endpoints
 app.post("/api/activity", async (req, res) => {
   try {
@@ -1282,6 +1874,75 @@ app.get("/api/recommendations/:uid", async (req, res) => {
   }
 });
 
+app.post("/api/reviews", verifyToken, async (req, res) => {
+  try {
+    const rawRating = Number(req.body.rating);
+    const rating = Number.isFinite(rawRating) ? Math.round(rawRating) : NaN;
+    const comment = req.body.comment?.toString().trim() || "";
+
+    if (!rating || rating < 1 || rating > 5) {
+      return res
+        .status(400)
+        .json({ error: "Rating between 1 and 5 is required" });
+    }
+
+    const db = mongoose.connection.useDb("healers");
+    const UserModel = db.models.User || db.model("User", userSchema);
+
+    let userName = req.user.name || "";
+    let userEmail = req.user.email || "";
+
+    if (!userName || !userEmail) {
+      const dbUser = await UserModel.findOne({ uid: req.user.uid })
+        .select("name email")
+        .lean();
+      userName = dbUser?.name || userName;
+      userEmail = dbUser?.email || userEmail;
+    }
+
+    const review = await Review.create({
+      userId: req.user.uid,
+      userName,
+      userEmail,
+      rating,
+      comment,
+    });
+
+    await notifyAdmins({
+      type: "review_submitted",
+      title: "নতুন রিভিউ এসেছে",
+      message: `${userName || userEmail || "Unknown user"} gave a ${rating}/5 review`,
+      metadata: {
+        reviewId: review._id.toString(),
+        rating,
+        comment,
+        userId: req.user.uid,
+        userEmail: req.user.email,
+      },
+    });
+
+    res.status(201).json({ review });
+  } catch (err) {
+    console.error("Failed to submit review:", err);
+    res.status(500).json({ error: "Failed to submit review" });
+  }
+});
+
+app.get(
+  "/api/reviews/admin",
+  verifyToken,
+  requireStaffOrAdmin,
+  async (req, res) => {
+    try {
+      const reviews = await Review.find().sort({ createdAt: -1 }).lean();
+      res.json({ reviews });
+    } catch (err) {
+      console.error("Failed to fetch reviews:", err);
+      res.status(500).json({ error: "Failed to fetch reviews" });
+    }
+  }
+);
+
 // Admin: Update user role
 app.put("/api/users/:uid/role", async (req, res) => {
   try {
@@ -1325,10 +1986,14 @@ app.put("/api/users/:uid/role", async (req, res) => {
 // Song add/update
 app.post("/api/songs", verifyToken, async (req, res) => {
   try {
-    const { title, artist, genre, cover, audio } = req.body;
+    const { title, artist, artists, genre, cover, audio } = req.body;
     const song = new Song({
       title,
-      artist,
+      artist:
+        typeof artist === "string" && artist.trim()
+          ? artist.trim()
+          : resolveArtistsArray(artists, artist).join(", "),
+      artists: resolveArtistsArray(artists, artist),
       genre:
         typeof genre === "string"
           ? genre.split(",").map((g) => g.trim())
@@ -1355,14 +2020,43 @@ app.post("/api/songs", verifyToken, async (req, res) => {
 app.put("/api/songs/:id", verifyToken, async (req, res) => {
   try {
     // Remove duration from update
-    const { title, artist, genre, cover, audio } = req.body;
-    const updateData = {
-      title,
-      artist,
-      genre,
-      cover,
-      audio,
-    };
+    const { title, artist, artists, genre, cover, audio } = req.body;
+    const updateData = {};
+
+    if (typeof title === "string") {
+      updateData.title = title.trim();
+    }
+
+    if (cover !== undefined) {
+      updateData.cover = cover;
+    }
+
+    if (audio !== undefined) {
+      updateData.audio = audio;
+    }
+
+    if (genre !== undefined) {
+      if (Array.isArray(genre)) {
+        updateData.genre = genre;
+      } else if (typeof genre === "string" && genre.trim()) {
+        updateData.genre = [genre.trim()];
+      }
+    }
+
+    if (artist !== undefined || (Array.isArray(artists) && artists.length)) {
+      const artistList = resolveArtistsArray(artists, artist);
+      if (artistList.length) {
+        updateData.artists = artistList;
+        updateData.artist =
+          typeof artist === "string" && artist.trim()
+            ? artist.trim()
+            : artistList.join(", ");
+      } else if (typeof artist === "string") {
+        updateData.artist = artist.trim();
+        updateData.artists = [];
+      }
+    }
+
     const updated = await Song.findByIdAndUpdate(req.params.id, updateData, {
       new: true,
     });
