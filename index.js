@@ -1916,6 +1916,20 @@ app.post("/api/reviews", verifyToken, async (req, res) => {
       userImage = dbUser?.image || userImage;
     }
 
+    const duplicateWindowMs = 2 * 60 * 1000; // 2 minutes
+    const recentDuplicate = await Review.findOne({
+      userId: req.user.uid,
+      rating,
+      comment,
+      createdAt: { $gte: new Date(Date.now() - duplicateWindowMs) },
+    }).lean();
+
+    if (recentDuplicate) {
+      return res
+        .status(200)
+        .json({ review: recentDuplicate, duplicate: true });
+    }
+
     const review = await Review.create({
       userId: req.user.uid,
       userName,
